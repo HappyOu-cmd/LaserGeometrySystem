@@ -89,11 +89,49 @@ python -m ensurepip --upgrade
 ### Проблема: "Permission denied" при установке пакетов
 **Решение:** Запустите командную строку от имени администратора
 
-### Проблема: "No module named 'pymodbus'"
-**Решение:** Убедитесь, что виртуальное окружение активировано и запустите:
-```bash
-pip install -r requirements.txt
-```
+### Проблема: "No module named 'pymodbus'" (хотя установлен)
+**Это самая частая проблема!** Обычно означает, что пакет установлен не в то окружение.
+
+**Решения:**
+
+1. **Убедитесь, что виртуальное окружение активировано:**
+   ```bash
+   # В начале строки должно быть (venv)
+   (venv) C:\Projects\LaserGeometry>
+   ```
+
+2. **Проверьте, какой Python используется:**
+   ```bash
+   python --version
+   where python
+   # Должен показывать путь к venv\Scripts\python.exe
+   ```
+
+3. **Переустановите пакеты в виртуальном окружении:**
+   ```bash
+   pip uninstall pymodbus -y
+   pip install pymodbus>=3.6.0
+   ```
+
+4. **Проверьте установку:**
+   ```bash
+   python -c "import pymodbus; print(pymodbus.__version__)"
+   ```
+
+5. **Если ничего не помогает - пересоздайте окружение:**
+   ```bash
+   deactivate
+   rmdir /s venv
+   python -m venv venv
+   venv\Scripts\activate
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+
+6. **Используйте скрипт проверки:**
+   ```bash
+   python check_installation.py
+   ```
 
 ### Проблема: COM порт занят
 **Решение:** 
