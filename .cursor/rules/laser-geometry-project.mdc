@@ -1,0 +1,45 @@
+---
+alwaysApply: true
+description: Laser Geometry System Development Rules
+---
+
+# Laser Geometry System Development Rules
+
+## Project Context
+This is a laser geometry measurement system with 4 RF602 triangulation sensors, Modbus server integration, and state machine automation. Main project file is [laser_geometry_system.py](mdc:laser_geometry_system.py). Always reference [PROJECT_CONTEXT.md](mdc:PROJECT_CONTEXT.md) for complete project details.
+
+## Core Development Principles
+
+### File Management
+- **NEVER create many files** - only what's absolutely necessary
+- **NEVER write lengthy code** - only the essential parts
+- Keep modular structure but avoid redundancy
+- Main files: [laser_geometry_system.py](mdc:laser_geometry_system.py), [modbus_debug_gui.py](mdc:modbus_debug_gui.py), [modbus_database.py](mdc:modbus_database.py)
+
+### Development Process
+- **ALWAYS clarify before implementation** - confirm understanding of requirements
+- **NEVER invent anything** - only implement what's explicitly specified
+- **ALWAYS maintain task context** - reference [PROJECT_CONTEXT.md](mdc:PROJECT_CONTEXT.md)
+- **ONLY fill context when fully understood** - don't guess requirements
+
+### Technical Standards
+- **NO emojis** - encoding issues in Windows
+- **Precision**: 3 decimal places (mm)
+- **Format**: DoubleWord float in Modbus registers
+- **HMI compatibility**: high word in 40002, low word in 40003
+- **Auto-reset**: command = 0 after calibration
+
+### Current Status
+- ✅ Wall calibration (CMD=100) - COMPLETE
+- ✅ SQLite database - COMPLETE
+- ✅ HMI compatibility - COMPLETE
+- ⏳ Flange calibration (CMD=101) - NEXT TASK
+- ⏳ Bottom calibration (CMD=102) - NEXT TASK
+
+### Modbus Register Mapping
+- **Holding Registers (40001+)**: Commands and settings
+- **Input Registers (30001+)**: Measurement results
+- **DoubleWord floats**: Stored in two consecutive registers
+- **Database**: Automatic save/load via [modbus_database_integration.py](mdc:modbus_database_integration.py)
+
+Always follow these rules when working on the laser geometry system.

@@ -92,7 +92,19 @@ python -m ensurepip --upgrade
 ### Проблема: "No module named 'pymodbus'" (хотя установлен)
 **Это самая частая проблема!** Обычно означает, что пакет установлен не в то окружение.
 
-**Решения:**
+**АВТОМАТИЧЕСКОЕ РЕШЕНИЕ (рекомендуется):**
+
+1. **Активируйте виртуальное окружение:**
+   ```bash
+   venv\Scripts\activate
+   ```
+
+2. **Запустите скрипт исправления:**
+   ```bash
+   python fix_pymodbus.bat
+   ```
+
+**ИЛИ ВРУЧНУЮ:**
 
 1. **Убедитесь, что виртуальное окружение активировано:**
    ```bash
@@ -102,35 +114,35 @@ python -m ensurepip --upgrade
 
 2. **Проверьте, какой Python используется:**
    ```bash
-   python --version
    where python
-   # Должен показывать путь к venv\Scripts\python.exe
+   # Должен показывать: ...\LaserGeometry\venv\Scripts\python.exe
    ```
 
-3. **Переустановите пакеты в виртуальном окружении:**
+3. **Полностью переустановите pymodbus:**
    ```bash
-   pip uninstall pymodbus -y
-   pip install pymodbus>=3.6.0
+   python -m pip uninstall pymodbus -y
+   python -m pip install --upgrade pip
+   python -m pip install pymodbus>=3.6.0,<4.0.0
    ```
 
 4. **Проверьте установку:**
    ```bash
-   python -c "import pymodbus; print(pymodbus.__version__)"
+   python -c "import pymodbus; print('OK:', pymodbus.__version__)"
    ```
 
-5. **Если ничего не помогает - пересоздайте окружение:**
+5. **Диагностика проблемы (если не помогло):**
+   ```bash
+   python diagnose_pymodbus.py
+   ```
+
+6. **Если ничего не помогает - пересоздайте окружение:**
    ```bash
    deactivate
-   rmdir /s venv
+   rmdir /s /q venv
    python -m venv venv
    venv\Scripts\activate
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-6. **Используйте скрипт проверки:**
-   ```bash
-   python check_installation.py
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
    ```
 
 ### Проблема: COM порт занят
