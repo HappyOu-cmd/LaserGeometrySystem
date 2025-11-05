@@ -1260,6 +1260,12 @@ class LaserGeometrySystem:
     
     def clear_measurement_buffers(self):
         """Очистка буферов измерений"""
+        # Очищаем основной буфер калибровок (measurement_buffer)
+        self.measurement_buffer['sensor1'].clear()
+        self.measurement_buffer['sensor2'].clear()
+        self.measurement_buffer['sensor3'].clear()
+        self.measurement_buffer['sensor4'].clear()
+        
         # Буферы команды 9 (высота)
         self.height_measurements = []
         self.obstacle_detected = False
@@ -1766,6 +1772,12 @@ class LaserGeometrySystem:
         if not self.sensors:
             print(" Ошибка: датчики не подключены!")
             return
+        
+        # Очищаем буферы перед началом измерений
+        self.measurement_buffer['sensor1'].clear()
+        self.measurement_buffer['sensor2'].clear()
+        self.measurement_buffer['sensor3'].clear()
+        self.measurement_buffer['sensor4'].clear()
             
         start_time = time.time()
         measurement_count = 0
@@ -2446,11 +2458,11 @@ class LaserGeometrySystem:
                         self.body_diameter_buffer.append(body_diameter)
                         
                         # 2) Диаметр фланца (Датчик 3)
-                        flange_diameter = distance_to_center - distance_1_3 - avg_sensor3
+                        flange_diameter = distance_to_center + distance_1_3 - avg_sensor3
                         self.flange_diameter_buffer.append(flange_diameter)
                         
                         # 3) Толщина фланца (Датчики 1,3)
-                        flange_thickness = avg_sensor1 - avg_sensor3
+                        flange_thickness = avg_sensor1 - avg_sensor3 + distance_1_3
                         self.flange_thickness_buffer.append(flange_thickness)
                         
                         # 4) Толщина дна (Датчик 4)
