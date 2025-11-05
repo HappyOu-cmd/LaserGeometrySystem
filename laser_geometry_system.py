@@ -287,6 +287,8 @@ class LaserGeometrySystem:
                 self.sensors = None  # Сбрасываем указатель на датчики
                 sensors_connected = False
             else:
+                # Очищаем буферы серийного порта после подключения
+                self.clear_serial_buffers()
                 print("OK Датчики подключены")
                 sensors_connected = True
         
@@ -479,6 +481,8 @@ class LaserGeometrySystem:
         
         if cmd == 0:
             self.current_state = SystemState.IDLE
+            # Очищаем буферы серийного порта при переходе в IDLE
+            self.clear_serial_buffers()
             
         # Калибровки
         elif cmd == 100:
@@ -499,6 +503,8 @@ class LaserGeometrySystem:
         # Потоковый режим (QUAD - все 4 датчика)
         elif cmd == 200:
             self.current_state = SystemState.STREAM_QUAD
+            # Очищаем буферы серийного порта при переходе в QUAD режим
+            self.clear_serial_buffers()
             
         # Основной цикл измерения - подсчёт верхней стенки
         elif cmd == 11:
@@ -647,13 +653,17 @@ class LaserGeometrySystem:
                 self.write_cycle_flag(0)
                 self.measurement_cycle_active = False
                 self.clear_measurement_buffers()
+                # Очищаем буферы серийного порта при переходе в IDLE
+                self.clear_serial_buffers()
                 print(" [16→0] Оценка завершена, цикл завершён, возврат в IDLE")
-
+            
             # === ЗАВЕРШЕНИЕ КАЛИБРОВКИ ВЫСОТЫ ===
             elif current_state_value == "CALIBRATE_HEIGHT" and new_cmd == 0:
                 # 103 → 0: завершение калибровки высоты
                 self.write_cycle_flag(0)
                 self.clear_measurement_buffers()
+                # Очищаем буферы серийного порта при переходе в IDLE
+                self.clear_serial_buffers()
                 print(" [103→0] Калибровка высоты завершена, возврат в IDLE")
             
             # === ЗАВЕРШЕНИЕ ОТЛАДКИ РЕГИСТРОВ ===
@@ -666,12 +676,16 @@ class LaserGeometrySystem:
                     delattr(self, 'debug_start_time')
                 if hasattr(self, 'debug_last_display'):
                     delattr(self, 'debug_last_display')
+                # Очищаем буферы серийного порта при переходе в IDLE
+                self.clear_serial_buffers()
                 print(" [104→0] Отладка регистров завершена, возврат в IDLE")
             
             # === ЗАВЕРШЕНИЕ КАЛИБРОВОК 100/101/102 ===
             elif current_state_value in ["CALIBRATE_WALL", "CALIBRATE_BOTTOM", "CALIBRATE_FLANGE"] and new_cmd == 0:
                 self.write_cycle_flag(0)
                 self.clear_measurement_buffers()
+                # Очищаем буферы серийного порта при переходе в IDLE
+                self.clear_serial_buffers()
                 print(f" [{current_state_value}→0] Калибровка завершена, возврат в IDLE")
             
             # === ПРЕРЫВАНИЕ ЦИКЛА (ОШИБКИ) ===
@@ -680,6 +694,8 @@ class LaserGeometrySystem:
                 self.write_cycle_flag(-1)
                 self.measurement_cycle_active = False
                 self.clear_measurement_buffers()
+                # Очищаем буферы серийного порта при переходе в IDLE
+                self.clear_serial_buffers()
                 print(f" [{current_state_value}→0] Цикл прерван! Ошибка.")
 
             # === ПОТОКОВЫЙ РЕЖИМ (CMD=200 - QUAD всех датчиков) ===
@@ -687,6 +703,8 @@ class LaserGeometrySystem:
                 # Устанавливаем статус равным номеру команды
                 self.write_cycle_flag(200)
                 self.clear_measurement_buffers()
+                # Очищаем буферы серийного порта перед началом QUAD режима
+                self.clear_serial_buffers()
                 print(f" [0→200] Начало QUAD потокового режима (все 4 датчика)")
             elif current_state_value == "STREAM_QUAD" and new_cmd == 0:
                 # Выход из потокового режима → 0
@@ -700,6 +718,8 @@ class LaserGeometrySystem:
                         print(" QUAD потоковый режим остановлен")
                     except Exception as e:
                         print(f" Ошибка остановки QUAD режима: {e}")
+                # Очищаем буферы серийного порта при переходе в IDLE
+                self.clear_serial_buffers()
                 print(f" [STREAM_QUAD→0] Выход из потокового режима")
                 
         except Exception as e:
@@ -836,6 +856,8 @@ class LaserGeometrySystem:
                 self.sensors = HighSpeedRiftekSensor(self.port, self.baudrate, timeout=0.002)
                 
                 if self.sensors.connect():
+                    # Очищаем буферы серийного порта после переподключения
+                    self.clear_serial_buffers()
                     print(" [ПЕРЕПОДКЛЮЧЕНИЕ] ✅ Датчики успешно переподключены!")
                     self.set_error_bit(0, False)  # Сбрасываем бит ошибки
                 else:
@@ -1231,6 +1253,18 @@ class LaserGeometrySystem:
             
         except Exception as e:
             print(f" Ошибка сброса счётчиков: {e}")
+    
+    def clear_serial_buffers(self):
+        """Очистка буферов серийного порта ОС Windows"""
+        try:
+            if self.sensors and self.sensors.ser:
+                if hasattr(self.sensors.ser, 'reset_input_buffer'):
+                    self.sensors.ser.reset_input_buffer()
+                if hasattr(self.sensors.ser, 'reset_output_buffer'):
+                    self.sensors.ser.reset_output_buffer()
+        except Exception as e:
+            # Игнорируем ошибки очистки буферов
+            pass
     
     def clear_measurement_buffers(self):
         """Очистка буферов измерений"""
@@ -1721,6 +1755,9 @@ class LaserGeometrySystem:
             print(" Ошибка: датчики не подключены!")
             return
         
+        # Очищаем буферы серийного порта перед началом измерений
+        self.clear_serial_buffers()
+        
         # Очищаем буферы перед началом измерений
         self.measurement_buffer['sensor1'].clear()
         self.measurement_buffer['sensor2'].clear()
@@ -1845,6 +1882,9 @@ class LaserGeometrySystem:
         
         print(" Начало измерений датчика 4...")
         
+        # Очищаем буферы серийного порта перед началом измерений
+        self.clear_serial_buffers()
+        
         # Очищаем буфер датчика 4
         self.measurement_buffer['sensor4'].clear()
         
@@ -1930,6 +1970,9 @@ class LaserGeometrySystem:
         measurement_count = 0
         
         print(" Начало измерений датчика 1...")
+        
+        # Очищаем буферы серийного порта перед началом измерений
+        self.clear_serial_buffers()
         
         # Очищаем буфер датчика 1
         self.measurement_buffer['sensor1'].clear()
@@ -2884,6 +2927,8 @@ class LaserGeometrySystem:
         try:
             # Инициализация при первом запуске
             if not self.stream_active_quad:
+                # Очищаем буферы серийного порта перед началом QUAD режима
+                self.clear_serial_buffers()
                 self.stream_active_quad = True
                 self.stream_measurement_count = 0
                 self.stream_start_time = time.time()
