@@ -188,6 +188,10 @@ class LaserGeometrySystem:
         self.distance_to_plane_calculated = False  # Флаг завершения расчёта дистанции (CMD=103)
         self.recent_measurements = []  # Буфер последних измерений для CMD=103
         
+        # Автоматическое переподключение датчиков
+        self.last_reconnect_attempt = 0  # Время последней попытки переподключения
+        self.reconnect_interval = 5.0  # Интервал попыток переподключения (секунды)
+        
         # Счетчики для потокового режима
         self.stream_measurement_count = 0
         self.stream_start_time = None
@@ -204,6 +208,12 @@ class LaserGeometrySystem:
         self.flange_calculated = False
         self.bottom_calculated = False
         self.quality_evaluated = False
+        
+        # Мониторинг в состоянии ожидания (IDLE)
+        self.idle_monitor_last_time = 0.0
+
+        # Номер смены (для сброса счётчиков при смене)
+        self.last_shift_number = None
         
         # Кеш калиброванных расстояний (для ускорения циклов измерения)
         self.cached_distance_1_2 = None
@@ -265,6 +275,7 @@ class LaserGeometrySystem:
         apply_laser_system_optimizations()
         
         # Инициализация датчиков
+        sensors_connected = False
         if self.test_mode:
             print("ТЕСТОВЫЙ РЕЖИМ - датчики не подключены")
             self.sensors = None
@@ -273,10 +284,13 @@ class LaserGeometrySystem:
             self.sensors = HighSpeedRiftekSensor(self.port, self.baudrate, timeout=0.002)
             
             if not self.sensors.connect():
-                print(" Ошибка подключения к датчикам!")
-                return False
-                
-        print("OK Датчики подключены")
+                print(" ВНИМАНИЕ: Ошибка подключения к датчикам!")
+                print(" Программа продолжит работу, но измерения будут недоступны.")
+                self.sensors = None  # Сбрасываем указатель на датчики
+                sensors_connected = False
+            else:
+                print("OK Датчики подключены")
+                sensors_connected = True
         
         # Инициализация Modbus сервера (без GUI, так как у нас есть Debug GUI)
         self.modbus_server = ModbusSlaveServer(enable_gui=False)
@@ -288,6 +302,22 @@ class LaserGeometrySystem:
         except Exception as e:
             print(f"Ошибка запуска Modbus сервера: {e}")
             return False
+        
+        # Теперь можем установить бит ошибки после инициализации Modbus сервера
+        if not sensors_connected:
+            self.set_error_bit(0, True)  # Устанавливаем бит 0 - ошибка подключения датчиков
+        else:
+            self.set_error_bit(0, False)  # Сбрасываем бит ошибки если подключение успешно
+
+        # Инициализируем номер смены для детектора смены
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                # 40100 -> индекс 99 в Holding регистрах
+                current_shift = self.modbus_server.slave_context.getValues(3, 99, 1)[0]
+                self.last_shift_number = int(current_shift)
+                print(f" [SHIFT] Текущая смена: {self.last_shift_number}")
+        except Exception as e:
+            print(f" [SHIFT] Ошибка чтения текущей смены при старте: {e}")
         
         # Инициализация интеграции с базой данных
         self.db_integration = ModbusDatabaseIntegration(self.modbus_server)
@@ -408,6 +438,10 @@ class LaserGeometrySystem:
                 except Exception as e:
                     print(f" Ошибка проверки регистра сброса 40024: {e}")
                 
+                # АВТОМАТИЧЕСКОЕ ПЕРЕПОДКЛЮЧЕНИЕ ДАТЧИКОВ (если не подключены)
+                if not self.test_mode:
+                    self.check_and_reconnect_sensors()
+                
                 # Проверяем команду от Modbus
                 current_cmd = self.get_current_command()
                 
@@ -415,6 +449,23 @@ class LaserGeometrySystem:
                     print(f"📨 Получена команда: {current_cmd}")
                     self.handle_command(current_cmd)
                     self.previous_cmd = current_cmd
+
+                # Детектор смены: при изменении 40100 сбрасываем счётчики 30101-30104
+                try:
+                    if self.modbus_server and self.modbus_server.slave_context:
+                        current_shift = int(self.modbus_server.slave_context.getValues(3, 99, 1)[0])  # 40100
+                        if self.last_shift_number is None:
+                            self.last_shift_number = current_shift
+                        elif current_shift != self.last_shift_number:
+                            print(f" [SHIFT] Смена изменилась: {self.last_shift_number} → {current_shift}. Сбрасываем счётчики за смену...")
+                            # 30101..30104 → индексы 100..103 в Input регистрах
+                            self.modbus_server.slave_context.setValues(4, 100, [0])  # всего
+                            self.modbus_server.slave_context.setValues(4, 101, [0])  # годных
+                            self.modbus_server.slave_context.setValues(4, 102, [0])  # условно-негодных
+                            self.modbus_server.slave_context.setValues(4, 103, [0])  # негодных
+                            self.last_shift_number = current_shift
+                except Exception as e:
+                    print(f" [SHIFT] Ошибка проверки/сброса счётчиков при смене: {e}")
                 
                 # Выполняем действия в зависимости от состояния
                 self.execute_state_actions()
@@ -701,6 +752,133 @@ class LaserGeometrySystem:
             print(f" [ФЛАГ 30009] ОШИБКА записи: {e}")
             import traceback
             traceback.print_exc()
+    
+    def set_error_bit(self, bit_number: int, value: bool):
+        """
+        Установка состояния ошибки в регистре 30058 как целого значения:
+        1 = есть ошибка, 0 = нет ошибки. bit_number игнорируется.
+        """
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                # Инвертируем: 1 = ПОДКЛЮЧЕНО (нет ошибки), 0 = ОТКЛЮЧЕНО (ошибка)
+                new_value = 0 if value else 1
+                # 30058 -> адрес 58 в блоке Input (старт с 1)
+                self.modbus_server.slave_context.setValues(4, 58, [int(new_value)])
+                print(f" [СОСТОЯНИЕ ДАТЧИКОВ] 30058 = {new_value} ({'OK' if new_value == 1 else 'НЕТ'})")
+        except Exception as e:
+            print(f" [ОШИБКА] Ошибка записи регистра 30058: {e}")
+    
+    def get_error_bit(self, bit_number: int) -> bool:
+        """
+        Возвращает True, если регистр 30058 равен 1 (есть ошибка), иначе False.
+        bit_number игнорируется.
+        """
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                # 30058 -> адрес 58 в блоке Input (старт с 1)
+                current_value = self.modbus_server.slave_context.getValues(4, 58, 1)[0]
+                # Возвращаем True, если ЕСТЬ ОШИБКА (для совместимости с названием функции)
+                # Ошибка теперь когда 30058 == 0
+                return int(current_value) == 0
+        except Exception as e:
+            print(f" [ОШИБКА] Ошибка чтения регистра 30058: {e}")
+        return False
+    
+    def _is_port_available(self, port_name: str) -> bool:
+        """
+        Проверяет наличие COM-порта в системе через pyserial.tools.list_ports.
+        Возвращает True, если порт есть в списке доступных.
+        """
+        try:
+            import serial.tools.list_ports as list_ports
+            ports = [p.device.upper() for p in list_ports.comports()]
+            return port_name.upper() in ports
+        except Exception:
+            return True  # если не удалось проверить — не блокируем логику
+    
+    def _is_sensor_connection_alive(self) -> bool:
+        """
+        Возвращает True, если объект датчиков есть, порт существует в системе,
+        и (если доступно) serial.is_open == True.
+        """
+        if self.sensors is None:
+            return False
+        if not self._is_port_available(self.port):
+            return False
+        ser = getattr(self.sensors, 'ser', None)
+        if ser is None:
+            return False
+        if hasattr(ser, 'is_open'):
+            try:
+                return bool(ser.is_open)
+            except Exception:
+                return False
+        return True
+    
+    def check_and_reconnect_sensors(self):
+        """
+        Проверка и автоматическое переподключение датчиков, если они не подключены
+        Вызывается периодически в основном цикле
+        """
+        try:
+            # Проверяем, что Modbus сервер инициализирован
+            if not self.modbus_server or not self.modbus_server.slave_context:
+                return  # Modbus сервер еще не готов
+            
+            # Проверяем, нужно ли пытаться переподключиться
+            if self.sensors is not None:
+                # Комплексная проверка соединения
+                if not self._is_sensor_connection_alive():
+                    print(" [ПОДКЛЮЧЕНИЕ] Соединение с датчиками потеряно. Помечаем как отключенные.")
+                    self.sensors = None
+                    self.set_error_bit(0, True)
+                    self.last_reconnect_attempt = 0  # разрешить немедленную попытку
+                else:
+                    if self.get_error_bit(0):
+                        self.set_error_bit(0, False)
+                    return
+            
+            # Датчики не подключены - проверяем интервал перед следующей попыткой
+            current_time = time.time()
+            time_since_last_attempt = current_time - self.last_reconnect_attempt
+            
+            # Попытки переподключения делаем по таймеру, даже если бит ошибки не установлен
+            should_attempt = (self.last_reconnect_attempt == 0) or (time_since_last_attempt >= self.reconnect_interval)
+            
+            # Отладочное сообщение для диагностики
+            if should_attempt:
+                current_err = None
+                try:
+                    current_err = self.get_error_bit(0)
+                except Exception:
+                    current_err = None
+                print(f" [ПЕРЕПОДКЛЮЧЕНИЕ] Проверка: датчики=None, бит_ошибки={current_err}, время_с_последней_попытки={time_since_last_attempt:.1f}с")
+            
+            if should_attempt:
+                # Пытаемся переподключиться
+                self.last_reconnect_attempt = current_time
+                print(f" [ПЕРЕПОДКЛЮЧЕНИЕ] Попытка переподключения датчиков на порту {self.port}...")
+                
+                self.sensors = HighSpeedRiftekSensor(self.port, self.baudrate, timeout=0.002)
+                
+                if self.sensors.connect():
+                    print(" [ПЕРЕПОДКЛЮЧЕНИЕ] ✅ Датчики успешно переподключены!")
+                    self.set_error_bit(0, False)  # Сбрасываем бит ошибки
+                else:
+                    print(f" [ПЕРЕПОДКЛЮЧЕНИЕ] ❌ Ошибка переподключения, повторим через {self.reconnect_interval:.0f} сек")
+                    self.sensors = None  # Сбрасываем указатель
+                    self.set_error_bit(0, True)  # Устанавливаем бит ошибки
+            # else: не прошло достаточно времени с последней попытки - ничего не делаем
+                
+        except Exception as e:
+            print(f" [ПЕРЕПОДКЛЮЧЕНИЕ] Ошибка при проверке/переподключении датчиков: {e}")
+            import traceback
+            traceback.print_exc()
+            self.sensors = None
+            try:
+                self.set_error_bit(0, True)
+            except:
+                pass  # Если Modbus сервер еще не готов, игнорируем ошибку
     
     def increment_product_number(self):
         """Увеличение номера изделия при успешном завершении цикла"""
@@ -1406,8 +1584,21 @@ class LaserGeometrySystem:
     
     def handle_idle_state(self):
         """Обработка состояния ожидания"""
-        # В состоянии ожидания ничего не делаем
-        pass
+        try:
+            # Раз в секунду мониторим подключение датчиков и выполняем авто-переподключение
+            current_time = time.time()
+            if current_time - self.idle_monitor_last_time >= 1.0:
+                self.idle_monitor_last_time = current_time
+                if not self.test_mode:
+                    self.check_and_reconnect_sensors()
+                    # Однострочный статус без спама
+                    connected = self._is_sensor_connection_alive()
+                    print(f" [IDLE] Мониторинг подключения датчиков: {'OK' if connected else 'НЕТ'}")
+                # Убедимся, что статус ожидания команды остаётся 30009=0
+                if self.modbus_server and self.modbus_server.slave_context:
+                    self.modbus_server.slave_context.setValues(4, 8, [0])  # 30009 -> index 8
+        except Exception as e:
+            print(f" [IDLE] Ошибка мониторинга: {e}")
     
     def handle_calibrate_wall_state(self):
         """Обработка калибровки стенки (CMD = 100)"""
