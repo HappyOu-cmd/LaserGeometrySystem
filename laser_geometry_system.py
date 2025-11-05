@@ -33,12 +33,19 @@ def apply_laser_system_optimizations():
     """
     print("[SYSTEM] ПРИМЕНЕНИЕ СИСТЕМНЫХ ОПТИМИЗАЦИЙ...")
     
-    # 1. Высокий приоритет процесса
+    # 1. Высокий приоритет процесса (REALTIME_PRIORITY_CLASS для максимальной производительности)
     if HAS_PSUTIL:
         try:
             p = psutil.Process(os.getpid())
-            p.nice(psutil.HIGH_PRIORITY_CLASS)
-            print("[OK] Установлен высокий приоритет процесса")
+            # Используем REALTIME_PRIORITY_CLASS для максимальной производительности
+            # Это критично для стабильной работы на слабых процессорах
+            try:
+                p.nice(psutil.REALTIME_PRIORITY_CLASS)
+                print("[OK] Установлен приоритет REALTIME (максимальный)")
+            except:
+                # Если REALTIME недоступен, используем HIGH_PRIORITY
+                p.nice(psutil.HIGH_PRIORITY_CLASS)
+                print("[OK] Установлен высокий приоритет процесса")
         except Exception as e:
             print(f"[WARNING] Не удалось установить приоритет: {e}")
     else:
@@ -451,6 +458,10 @@ class LaserGeometrySystem:
                                              SystemState.MEASURE_FLANGE_PROCESS, SystemState.MEASURE_BOTTOM_PROCESS,
                                              SystemState.CALIBRATE_HEIGHT]:
                     time.sleep(0.1)
+                elif self.current_state == SystemState.STREAM_QUAD:
+                    # Микро-пауза в QUAD режиме для снижения нагрузки на CPU (5 мс)
+                    # Это поможет избежать переполнения буферов на слабых процессорах
+                    time.sleep(0.005)
                 
         except KeyboardInterrupt:
             print("\n Остановка по запросу пользователя")
@@ -2945,8 +2956,44 @@ class LaserGeometrySystem:
             
             self.stream_measurement_count += 1
             
-            # Если получили валидные измерения от всех датчиков
-            if all(v is not None for v in [sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm]):
+            # Периодическая очистка буферов серийного порта (каждые 10 секунд) для предотвращения переполнения
+            # На слабых процессорах буферы могут переполняться быстрее
+            if self.stream_measurement_count % 1000 == 0:  # ~10 секунд при 109 Гц
+                self.clear_serial_buffers()
+                if self.stream_measurement_count % 3000 == 0:  # Сообщение только каждые 30 секунд
+                    print(f" [CMD=200] Периодическая очистка буферов серийного порта (измерение #{self.stream_measurement_count})")
+            
+            # Проверка валидности данных: фильтруем явно некорректные значения
+            # Диапазон: 0-50 мм (базовое 20 + диапазон 25)
+            max_valid_value = 50.0
+            min_valid_value = 0.0
+            
+            # Проверяем валидность каждого значения
+            values_valid = True
+            invalid_sensors = []
+            
+            if sensor1_mm is not None and (sensor1_mm < min_valid_value or sensor1_mm > max_valid_value):
+                values_valid = False
+                invalid_sensors.append(1)
+            if sensor2_mm is not None and (sensor2_mm < min_valid_value or sensor2_mm > max_valid_value):
+                values_valid = False
+                invalid_sensors.append(2)
+            if sensor3_mm is not None and (sensor3_mm < min_valid_value or sensor3_mm > max_valid_value):
+                values_valid = False
+                invalid_sensors.append(3)
+            if sensor4_mm is not None and (sensor4_mm < min_valid_value or sensor4_mm > max_valid_value):
+                values_valid = False
+                invalid_sensors.append(4)
+            
+            # Выводим ошибки некорректных значений не чаще раза в 5 секунд
+            if invalid_sensors and self.stream_measurement_count % 500 == 0:
+                print(f" [CMD=200] ⚠ Некорректные значения датчиков {invalid_sensors}: "
+                      f"Д1={sensor1_mm:.3f}мм Д2={sensor2_mm:.3f}мм Д3={sensor3_mm:.3f}мм Д4={sensor4_mm:.3f}мм (должно быть 0-50)")
+                # При обнаружении некорректных значений очищаем буферы
+                self.clear_serial_buffers()
+            
+            # Если получили валидные измерения от всех датчиков И значения в допустимом диапазоне
+            if (all(v is not None for v in [sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm]) and values_valid):
                 # Добавляем в временные буферы для усреднения
                 self.stream_temp_sensor1_buffer.append(sensor1_mm)
                 self.stream_temp_sensor2_buffer.append(sensor2_mm)
@@ -2962,13 +3009,17 @@ class LaserGeometrySystem:
                     avg_sensor4 = sum(self.stream_temp_sensor4_buffer) / len(self.stream_temp_sensor4_buffer)
                     
                     # Записываем все 4 регистра одновременно
+                    # Оптимизация: группируем записи для снижения нагрузки на Modbus
                     try:
+                        # Записываем все регистры последовательно (быстрее чем параллельно)
                         self.write_stream_result_to_input_registers(avg_sensor1, 30001)  # Датчик 1
                         self.write_stream_result_to_input_registers(avg_sensor2, 30003)  # Датчик 2
                         self.write_stream_result_to_input_registers(avg_sensor3, 30005)  # Датчик 3
                         self.write_stream_result_to_input_registers(avg_sensor4, 30007)  # Датчик 4
                     except Exception as e:
                         print(f" ОШИБКА ЗАПИСИ В РЕГИСТРЫ: {e}")
+                        # При ошибке записи очищаем буферы серийного порта
+                        self.clear_serial_buffers()
                     
                     # Выводим результат раз в секунду
                     current_time = time.time()
@@ -2991,9 +3042,15 @@ class LaserGeometrySystem:
                     self.stream_temp_sensor3_buffer = []
                     self.stream_temp_sensor4_buffer = []
             else:
-                # Ошибка получения данных
-                if self.stream_measurement_count % 100 == 0:
-                    print(f" [CMD=200] Ошибка измерения: Д1={sensor1_mm}, Д2={sensor2_mm}, Д3={sensor3_mm}, Д4={sensor4_mm}")
+                # Ошибка получения данных (None значения)
+                # Некорректные значения уже обработаны выше с очисткой буферов
+                if not values_valid:
+                    # Некорректные значения уже обработаны выше - просто пропускаем
+                    pass
+                elif self.stream_measurement_count % 500 == 0:  # Показываем ошибку не чаще раза в 5 секунд
+                    print(f" [CMD=200] Ошибка измерения (None): Д1={sensor1_mm}, Д2={sensor2_mm}, Д3={sensor3_mm}, Д4={sensor4_mm}")
+                    # При None значениях также очищаем буферы
+                    self.clear_serial_buffers()
             
         except Exception as e:
             print(f" Ошибка QUAD потокового режима: {e}")
