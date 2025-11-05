@@ -115,11 +115,8 @@ class SystemState(Enum):
     # Оценка качества изделия
     QUALITY_EVALUATION = "QUALITY_EVALUATION"  # CMD=16: оценка качества
     
-    # Потоковые режимы
-    STREAM_SENSOR1 = "STREAM_SENSOR1"
-    STREAM_SENSOR2 = "STREAM_SENSOR2"
-    STREAM_SENSOR3 = "STREAM_SENSOR3"
-    STREAM_SENSOR4 = "STREAM_SENSOR4"
+    # Потоковый режим (QUAD - все 4 датчика)
+    STREAM_QUAD = "STREAM_QUAD"  # CMD=200: QUAD режим всех датчиков
     
     ERROR = "ERROR"
 
@@ -180,10 +177,7 @@ class LaserGeometrySystem:
         # Флаги
         self.is_running = False
         self.calibration_in_progress = False
-        self.stream_active_sensor1 = False
-        self.stream_active_sensor2 = False
-        self.stream_active_sensor3 = False
-        self.stream_active_sensor4 = False
+        self.stream_active_quad = False  # Флаг активного QUAD режима
         self.height_calibration_nonzero_count = 0  # Счетчик ненулевых показаний для CMD=103
         self.distance_to_plane_calculated = False  # Флаг завершения расчёта дистанции (CMD=103)
         self.recent_measurements = []  # Буфер последних измерений для CMD=103
@@ -192,10 +186,14 @@ class LaserGeometrySystem:
         self.last_reconnect_attempt = 0  # Время последней попытки переподключения
         self.reconnect_interval = 5.0  # Интервал попыток переподключения (секунды)
         
-        # Счетчики для потокового режима
+        # Счетчики для потокового режима QUAD
         self.stream_measurement_count = 0
         self.stream_start_time = None
-        self.stream_measurements_buffer = []  # Буфер измерений за секунду
+        # Буферы для усреднения по 10 измерениям для каждого датчика
+        self.stream_temp_sensor1_buffer = []
+        self.stream_temp_sensor2_buffer = []
+        self.stream_temp_sensor3_buffer = []
+        self.stream_temp_sensor4_buffer = []
         
         # Буферы для основного цикла измерения
         self.sensor1_measurements = []  # Буфер усредненных измерений датчика 1
@@ -357,38 +355,13 @@ class LaserGeometrySystem:
         print("\n ОСТАНОВКА СИСТЕМЫ")
         self.is_running = False
         
-        # Остановка всех потоковых режимов
-        if self.sensors and self.stream_active_sensor1:
+        # Остановка QUAD потокового режима
+        if self.sensors and self.stream_active_quad:
             try:
-                self.sensors.stop_stream_mode(1)
-                self.stream_active_sensor1 = False
-                print(" Остановлен потоковый режим датчика 1")
+                self.stream_active_quad = False
+                print(" Остановлен QUAD потоковый режим")
             except Exception as e:
-                print(f" Ошибка остановки потокового режима датчика 1: {e}")
-        
-        if self.sensors and self.stream_active_sensor2:
-            try:
-                self.sensors.stop_stream_mode(2)
-                self.stream_active_sensor2 = False
-                print(" Остановлен потоковый режим датчика 2")
-            except Exception as e:
-                print(f" Ошибка остановки потокового режима датчика 2: {e}")
-        
-        if self.sensors and self.stream_active_sensor3:
-            try:
-                self.sensors.stop_stream_mode(3)
-                self.stream_active_sensor3 = False
-                print(" Остановлен потоковый режим датчика 3")
-            except Exception as e:
-                print(f" Ошибка остановки потокового режима датчика 3: {e}")
-        
-        if self.sensors and self.stream_active_sensor4:
-            try:
-                self.sensors.stop_stream_mode(4)
-                self.stream_active_sensor4 = False
-                print(" Остановлен потоковый режим датчика 4")
-            except Exception as e:
-                print(f" Ошибка остановки потокового режима датчика 4: {e}")
+                print(f" Ошибка остановки QUAD режима: {e}")
         
         if self.sensors:
             try:
@@ -471,8 +444,7 @@ class LaserGeometrySystem:
                 self.execute_state_actions()
                 
                 # Пауза только если НЕ потоковый режим (иначе тормозит поток!)
-                if self.current_state not in [SystemState.STREAM_SENSOR1, SystemState.STREAM_SENSOR2, 
-                                             SystemState.STREAM_SENSOR3, SystemState.STREAM_SENSOR4, 
+                if self.current_state not in [SystemState.STREAM_QUAD, 
                                              SystemState.MEASURE_HEIGHT_PROCESS, SystemState.MEASURE_WALL_PROCESS, 
                                              SystemState.MEASURE_FLANGE_PROCESS, SystemState.MEASURE_BOTTOM_PROCESS,
                                              SystemState.CALIBRATE_HEIGHT]:
@@ -524,15 +496,9 @@ class LaserGeometrySystem:
         elif cmd == 10:
             self.current_state = SystemState.MEASURE_WALL_PROCESS
             
-        # Потоковые режимы
+        # Потоковый режим (QUAD - все 4 датчика)
         elif cmd == 200:
-            self.current_state = SystemState.STREAM_SENSOR1
-        elif cmd == 201:
-            self.current_state = SystemState.STREAM_SENSOR2
-        elif cmd == 202:
-            self.current_state = SystemState.STREAM_SENSOR3
-        elif cmd == 203:
-            self.current_state = SystemState.STREAM_SENSOR4
+            self.current_state = SystemState.STREAM_QUAD
             
         # Основной цикл измерения - подсчёт верхней стенки
         elif cmd == 11:
@@ -716,17 +682,25 @@ class LaserGeometrySystem:
                 self.clear_measurement_buffers()
                 print(f" [{current_state_value}→0] Цикл прерван! Ошибка.")
 
-            # === ПОТОКОВЫЕ РЕЖИМЫ (200/201/202/203) ===
-            elif current_state_value == "IDLE" and new_cmd in [200, 201, 202, 203]:
+            # === ПОТОКОВЫЙ РЕЖИМ (CMD=200 - QUAD всех датчиков) ===
+            elif current_state_value == "IDLE" and new_cmd == 200:
                 # Устанавливаем статус равным номеру команды
-                self.write_cycle_flag(new_cmd)
+                self.write_cycle_flag(200)
                 self.clear_measurement_buffers()
-                print(f" [0→{new_cmd}] Начало потокового режима")
-            elif current_state_value in ["STREAM_SENSOR1", "STREAM_SENSOR2", "STREAM_SENSOR3", "STREAM_SENSOR4"] and new_cmd == 0:
+                print(f" [0→200] Начало QUAD потокового режима (все 4 датчика)")
+            elif current_state_value == "STREAM_QUAD" and new_cmd == 0:
                 # Выход из потокового режима → 0
                 self.write_cycle_flag(0)
                 self.clear_measurement_buffers()
-                print(f" [{current_state_value}→0] Выход из потокового режима")
+                # Останавливаем QUAD режим
+                if self.sensors and self.stream_active_quad:
+                    try:
+                        # QUAD режим не использует потоковый режим датчиков, просто останавливаем измерения
+                        self.stream_active_quad = False
+                        print(" QUAD потоковый режим остановлен")
+                    except Exception as e:
+                        print(f" Ошибка остановки QUAD режима: {e}")
+                print(f" [STREAM_QUAD→0] Выход из потокового режима")
                 
         except Exception as e:
             print(f" Ошибка управления флагом цикла: {e}")
@@ -1302,42 +1276,22 @@ class LaserGeometrySystem:
         self.temp_sensor2_bottom_buffer = []
         self.bottom_wall_thickness_buffer = []
         
+        # Буферы QUAD потокового режима (CMD=200)
+        self.stream_temp_sensor1_buffer = []
+        self.stream_temp_sensor2_buffer = []
+        self.stream_temp_sensor3_buffer = []
+        self.stream_temp_sensor4_buffer = []
+        
         print(" Буферы измерений очищены")
     
     def stop_all_streams(self):
         """Остановка всех активных потоковых режимов"""
-        if self.sensors:
-            if self.stream_active_sensor1:
-                try:
-                    self.sensors.stop_stream_mode(1)
-                    self.stream_active_sensor1 = False
-                    print(" Остановлен поток датчика 1")
-                except Exception as e:
-                    print(f" Ошибка остановки потока датчика 1: {e}")
-            
-            if self.stream_active_sensor2:
-                try:
-                    self.sensors.stop_stream_mode(2)
-                    self.stream_active_sensor2 = False
-                    print(" Остановлен поток датчика 2")
-                except Exception as e:
-                    print(f" Ошибка остановки потока датчика 2: {e}")
-            
-            if self.stream_active_sensor3:
-                try:
-                    self.sensors.stop_stream_mode(3)
-                    self.stream_active_sensor3 = False
-                    print(" Остановлен поток датчика 3")
-                except Exception as e:
-                    print(f" Ошибка остановки потока датчика 3: {e}")
-            
-            if self.stream_active_sensor4:
-                try:
-                    self.sensors.stop_stream_mode(4)
-                    self.stream_active_sensor4 = False
-                    print(" Остановлен поток датчика 4")
-                except Exception as e:
-                    print(f" Ошибка остановки потока датчика 4: {e}")
+        if self.sensors and self.stream_active_quad:
+            try:
+                self.stream_active_quad = False
+                print(" Остановлен QUAD потоковый режим")
+            except Exception as e:
+                print(f" Ошибка остановки QUAD режима: {e}")
     
     def execute_state_actions(self):
         """Выполнение действий в зависимости от текущего состояния"""
@@ -1382,15 +1336,9 @@ class LaserGeometrySystem:
         elif self.current_state == SystemState.QUALITY_EVALUATION:
             self.handle_quality_evaluation_state()
             
-        # Потоковые режимы
-        elif self.current_state == SystemState.STREAM_SENSOR1:
-            self.handle_stream_sensor1_state()
-        elif self.current_state == SystemState.STREAM_SENSOR2:
-            self.handle_stream_sensor2_state()
-        elif self.current_state == SystemState.STREAM_SENSOR3:
-            self.handle_stream_sensor3_state()
-        elif self.current_state == SystemState.STREAM_SENSOR4:
-            self.handle_stream_sensor4_state()
+        # Потоковый режим (QUAD - все 4 датчика)
+        elif self.current_state == SystemState.STREAM_QUAD:
+            self.handle_stream_quad_state()
             
         elif self.current_state == SystemState.ERROR:
             self.handle_error_state()
@@ -2917,292 +2865,96 @@ class LaserGeometrySystem:
     
     # ===== КОНЕЦ НОВЫХ МЕТОДОВ =====
     
-    def handle_stream_sensor1_state(self):
-        """Потоковый режим датчика 1 (CMD=200)"""
+    def handle_stream_quad_state(self):
+        """Потоковый режим QUAD (CMD=200) - все 4 датчика одновременно"""
         if not self.sensors:
-            print(" Ошибка: датчики не подключены для датчика 1!")
+            print(" Ошибка: датчики не подключены!")
             self.current_state = SystemState.ERROR
             return
         
         # Проверяем смену команды
         current_cmd = self.get_current_command()
         if current_cmd != 200:
-            print(f" Команда изменилась с 200 на {current_cmd}. Выходим из потокового режима датчика 1")
+            print(f" Команда изменилась с 200 на {current_cmd}. Выходим из QUAD потокового режима")
+            # Останавливаем QUAD режим
+            self.stream_active_quad = False
             self.handle_command(current_cmd)
             return
         
         try:
-            # Запускаем потоковый режим если еще не запущен
-            if not self.stream_active_sensor1:
-                if self.sensors.start_stream_mode(1):
-                    self.stream_active_sensor1 = True
-                    self.stream_measurement_count = 0
-                    self.stream_start_time = time.time()
-                    self.stream_measurements_buffer = []  # Очищаем буфер
-                    print(" Запущен потоковый режим для датчика 1")
-                else:
-                    print(" Ошибка запуска потокового режима для датчика 1")
-                    self.current_state = SystemState.ERROR
-                    return
+            # Инициализация при первом запуске
+            if not self.stream_active_quad:
+                self.stream_active_quad = True
+                self.stream_measurement_count = 0
+                self.stream_start_time = time.time()
+                self.stream_temp_sensor1_buffer = []
+                self.stream_temp_sensor2_buffer = []
+                self.stream_temp_sensor3_buffer = []
+                self.stream_temp_sensor4_buffer = []
+                print(" Запущен QUAD потоковый режим (все 4 датчика)")
             
-            # Читаем одно измерение из потока (как в main.py)
-            measurement = self.sensors.read_stream_data(self.sensor_range_mm)
+            # Выполняем QUAD измерение (все 4 датчика одновременно)
+            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
+                self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
+            )
+            
             self.stream_measurement_count += 1
             
-            # Если получили валидное измерение, добавляем в буфер для усреднения
-            if measurement is not None:
-                # НЕ ОКРУГЛЯЕМ - сохраняем максимальную точность!
-                self.stream_measurements_buffer.append(measurement)
+            # Если получили валидные измерения от всех датчиков
+            if all(v is not None for v in [sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm]):
+                # Добавляем в временные буферы для усреднения
+                self.stream_temp_sensor1_buffer.append(sensor1_mm)
+                self.stream_temp_sensor2_buffer.append(sensor2_mm)
+                self.stream_temp_sensor3_buffer.append(sensor3_mm)
+                self.stream_temp_sensor4_buffer.append(sensor4_mm)
                 
-                # ОТЛАДКА: показываем размер буфера каждые 50 измерений
-                if len(self.stream_measurements_buffer) % 50 == 0:
-                    print(f" ОТЛАДКА: В буфере {len(self.stream_measurements_buffer)} измерений, последнее: {measurement:.6f}мм")
-                
-                # Если накопилось >100 измерений - усредняем и отправляем в регистры!
-                if len(self.stream_measurements_buffer) > 100:
-                    avg_measurement = sum(self.stream_measurements_buffer) / len(self.stream_measurements_buffer)
-                    # НЕ ОКРУГЛЯЕМ СРЕДНЕЕ - максимальная точность!
+                # Когда накопилось 10 измерений - усредняем и записываем в регистры
+                if len(self.stream_temp_sensor1_buffer) >= 10:
+                    # Вычисляем средние значения для каждого датчика
+                    avg_sensor1 = sum(self.stream_temp_sensor1_buffer) / len(self.stream_temp_sensor1_buffer)
+                    avg_sensor2 = sum(self.stream_temp_sensor2_buffer) / len(self.stream_temp_sensor2_buffer)
+                    avg_sensor3 = sum(self.stream_temp_sensor3_buffer) / len(self.stream_temp_sensor3_buffer)
+                    avg_sensor4 = sum(self.stream_temp_sensor4_buffer) / len(self.stream_temp_sensor4_buffer)
                     
-                    print(f" УСРЕДНЕНИЕ: {len(self.stream_measurements_buffer)} измерений -> {avg_measurement:.6f}мм")
-                    
-                    # Отправляем в Input Register 30001-30002 (по аналогии с калибровкой)
+                    # Записываем все 4 регистра одновременно
                     try:
-                        self.write_stream_result_to_input_registers(avg_measurement, 30001)
-                        print(f" ЗАПИСЬ В РЕГИСТРЫ: {avg_measurement:.6f}мм -> 30001-30002 УСПЕШНО")
+                        self.write_stream_result_to_input_registers(avg_sensor1, 30001)  # Датчик 1
+                        self.write_stream_result_to_input_registers(avg_sensor2, 30003)  # Датчик 2
+                        self.write_stream_result_to_input_registers(avg_sensor3, 30005)  # Датчик 3
+                        self.write_stream_result_to_input_registers(avg_sensor4, 30007)  # Датчик 4
                     except Exception as e:
                         print(f" ОШИБКА ЗАПИСИ В РЕГИСТРЫ: {e}")
                     
-                    # Выводим результат
+                    # Выводим результат раз в секунду
                     current_time = time.time()
-                    elapsed = current_time - self.stream_start_time
-                    frequency = self.stream_measurement_count / elapsed if elapsed > 0 else 0
-                    valid_count = len(self.stream_measurements_buffer)
+                    if not hasattr(self, '_last_stream_quad_print'):
+                        self._last_stream_quad_print = current_time
                     
-                    print(f" Поток датчика 1: {elapsed:5.1f}с | Измерений: {self.stream_measurement_count:6d} | "
-                          f"Частота: {frequency:7.1f} Гц | Усреднено {valid_count} измерений | "
-                          f"Среднее: {avg_measurement:.6f}мм -> Регистры 30001-30002")
+                    if current_time - self._last_stream_quad_print >= 1.0:
+                        elapsed = current_time - self.stream_start_time
+                        frequency = self.stream_measurement_count / elapsed if elapsed > 0 else 0
+                        
+                        print(f" [CMD=200] QUAD: {elapsed:5.1f}с | Измерений: {self.stream_measurement_count:6d} | "
+                              f"Частота: {frequency:7.1f} Гц | "
+                              f"Д1={avg_sensor1:.3f}мм Д2={avg_sensor2:.3f}мм Д3={avg_sensor3:.3f}мм Д4={avg_sensor4:.3f}мм")
+                        
+                        self._last_stream_quad_print = current_time
                     
-                    # Очищаем буфер для следующих 100 измерений
-                    self.stream_measurements_buffer = []
-                    print(f" БУФЕР ОЧИЩЕН, размер: {len(self.stream_measurements_buffer)}")
+                    # Очищаем временные буферы для следующих 10 измерений
+                    self.stream_temp_sensor1_buffer = []
+                    self.stream_temp_sensor2_buffer = []
+                    self.stream_temp_sensor3_buffer = []
+                    self.stream_temp_sensor4_buffer = []
             else:
-                # ОТЛАДКА: показываем когда измерение None
-                if self.stream_measurement_count % 1000 == 0:
-                    print(f" ОТЛАДКА: Измерение #{self.stream_measurement_count} = None")
-                
-            # Диагностика раз в секунду (без усреднения)
-            current_time = time.time()
-            if hasattr(self, '_last_stream_print_1'):
-                if current_time - self._last_stream_print_1 > 1.0:  # Раз в секунду
-                    elapsed = current_time - self.stream_start_time
-                    frequency = self.stream_measurement_count / elapsed if elapsed > 0 else 0
-                    buffer_size = len(self.stream_measurements_buffer)
-                    
-                    print(f" Диагностика: {elapsed:5.1f}с | Измерений: {self.stream_measurement_count:6d} | "
-                          f"Частота: {frequency:7.1f} Гц | В буфере: {buffer_size}")
-                    
-                    self._last_stream_print_1 = current_time
-            else:
-                self._last_stream_print_1 = current_time
+                # Ошибка получения данных
+                if self.stream_measurement_count % 100 == 0:
+                    print(f" [CMD=200] Ошибка измерения: Д1={sensor1_mm}, Д2={sensor2_mm}, Д3={sensor3_mm}, Д4={sensor4_mm}")
             
         except Exception as e:
-            print(f" Ошибка потокового режима датчика 1: {e}")
-            # Останавливаем потоковый режим при ошибке
-            if self.stream_active_sensor1:
-                self.sensors.stop_stream_mode(1)
-                self.stream_active_sensor1 = False
+            print(f" Ошибка QUAD потокового режима: {e}")
+            # Останавливаем QUAD режим при ошибке
+            self.stream_active_quad = False
             self.current_state = SystemState.ERROR
-    
-    def handle_stream_sensor2_state(self):
-        """Потоковый режим датчика 2 (CMD=201)"""
-        if not self.sensors:
-            print(" Ошибка: датчики не подключены для датчика 2!")
-            self.current_state = SystemState.ERROR
-            return
-        
-        # Проверяем смену команды
-        current_cmd = self.get_current_command()
-        if current_cmd != 201:
-            print(f" Команда изменилась с 201 на {current_cmd}. Выходим из потокового режима датчика 2")
-            self.handle_command(current_cmd)
-            return
-        
-        try:
-            # Запускаем потоковый режим если еще не запущен
-            if not self.stream_active_sensor2:
-                if self.sensors.start_stream_mode(2):
-                    self.stream_active_sensor2 = True
-                    self.stream_measurement_count = 0
-                    self.stream_start_time = time.time()
-                    self.stream_measurements_buffer = []
-                    print(" Запущен потоковый режим для датчика 2")
-                else:
-                    print(" Ошибка запуска потокового режима для датчика 2")
-                    self.current_state = SystemState.ERROR
-                    return
-            
-            # Читаем одно измерение из потока
-            measurement = self.sensors.read_stream_data(self.sensor_range_mm)
-            self.stream_measurement_count += 1
-            
-            # Если получили валидное измерение, добавляем в буфер
-            if measurement is not None:
-                self.stream_measurements_buffer.append(measurement)
-                
-                # Если накопилось >100 измерений - усредняем и отправляем в регистры!
-                if len(self.stream_measurements_buffer) > 100:
-                    avg_measurement = sum(self.stream_measurements_buffer) / len(self.stream_measurements_buffer)
-                    
-                    # Отправляем в Input Register 30003-30004
-                    self.write_stream_result_to_input_registers(avg_measurement, 30003)
-                    
-                    # Выводим результат
-                    current_time = time.time()
-                    elapsed = current_time - self.stream_start_time
-                    frequency = self.stream_measurement_count / elapsed if elapsed > 0 else 0
-                    valid_count = len(self.stream_measurements_buffer)
-                    
-                    print(f" Поток датчика 2: {elapsed:5.1f}с | Измерений: {self.stream_measurement_count:6d} | "
-                          f"Частота: {frequency:7.1f} Гц | Усреднено {valid_count} измерений | "
-                          f"Среднее: {avg_measurement:.3f}мм")
-                    
-                    # Очищаем буфер для следующих 100 измерений
-                    self.stream_measurements_buffer = []
-                
-        except Exception as e:
-            print(f" Ошибка потокового режима датчика 2: {e}")
-            if self.stream_active_sensor2:
-                self.sensors.stop_stream_mode(2)
-                self.stream_active_sensor2 = False
-            self.current_state = SystemState.ERROR
-    
-    def handle_stream_sensor3_state(self):
-        """Потоковый режим датчика 3 (CMD=202)"""
-        if not self.sensors:
-            print(" Ошибка: датчики не подключены для датчика 3!")
-            self.current_state = SystemState.ERROR
-            return
-        
-        # Проверяем смену команды
-        current_cmd = self.get_current_command()
-        if current_cmd != 202:
-            print(f" Команда изменилась с 202 на {current_cmd}. Выходим из потокового режима датчика 3")
-            self.handle_command(current_cmd)
-            return
-        
-        try:
-            # Запускаем потоковый режим если еще не запущен
-            if not self.stream_active_sensor3:
-                if self.sensors.start_stream_mode(3):
-                    self.stream_active_sensor3 = True
-                    self.stream_measurement_count = 0
-                    self.stream_start_time = time.time()
-                    self.stream_measurements_buffer = []
-                    print(" Запущен потоковый режим для датчика 3")
-                else:
-                    print(" Ошибка запуска потокового режима для датчика 3")
-                    self.current_state = SystemState.ERROR
-                    return
-            
-            # Читаем одно измерение из потока
-            measurement = self.sensors.read_stream_data(self.sensor_range_mm)
-            self.stream_measurement_count += 1
-            
-            # Если получили валидное измерение, добавляем в буфер
-            if measurement is not None:
-                self.stream_measurements_buffer.append(measurement)
-                
-                # Если накопилось >100 измерений - усредняем и отправляем в регистры!
-                if len(self.stream_measurements_buffer) > 100:
-                    avg_measurement = sum(self.stream_measurements_buffer) / len(self.stream_measurements_buffer)
-                    
-                    # Отправляем в Input Register 30005-30006
-                    self.write_stream_result_to_input_registers(avg_measurement, 30005)
-                    
-                    # Выводим результат
-                    current_time = time.time()
-                    elapsed = current_time - self.stream_start_time
-                    frequency = self.stream_measurement_count / elapsed if elapsed > 0 else 0
-                    valid_count = len(self.stream_measurements_buffer)
-                    
-                    print(f" Поток датчика 3: {elapsed:5.1f}с | Измерений: {self.stream_measurement_count:6d} | "
-                          f"Частота: {frequency:7.1f} Гц | Усреднено {valid_count} измерений | "
-                          f"Среднее: {avg_measurement:.3f}мм")
-                    
-                    # Очищаем буфер для следующих 100 измерений
-                    self.stream_measurements_buffer = []
-                
-        except Exception as e:
-            print(f" Ошибка потокового режима датчика 3: {e}")
-            if self.stream_active_sensor3:
-                self.sensors.stop_stream_mode(3)
-                self.stream_active_sensor3 = False
-            self.current_state = SystemState.ERROR
-    
-    def handle_stream_sensor4_state(self):
-        """Потоковый режим датчика 4 (CMD=203)"""
-        if not self.sensors:
-            print(" Ошибка: датчики не подключены для датчика 4!")
-            self.current_state = SystemState.ERROR
-            return
-        
-        # Проверяем смену команды
-        current_cmd = self.get_current_command()
-        if current_cmd != 203:
-            print(f" Команда изменилась с 203 на {current_cmd}. Выходим из потокового режима датчика 4")
-            self.handle_command(current_cmd)
-            return
-        
-        try:
-            # Запускаем потоковый режим если еще не запущен
-            if not self.stream_active_sensor4:
-                if self.sensors.start_stream_mode(4):
-                    self.stream_active_sensor4 = True
-                    self.stream_measurement_count = 0
-                    self.stream_start_time = time.time()
-                    self.stream_measurements_buffer = []
-                    print(" Запущен потоковый режим для датчика 4")
-                else:
-                    print(" Ошибка запуска потокового режима для датчика 4")
-                    self.current_state = SystemState.ERROR
-                    return
-            
-            # Читаем одно измерение из потока
-            measurement = self.sensors.read_stream_data(self.sensor_range_mm)
-            self.stream_measurement_count += 1
-            
-            # Если получили валидное измерение, добавляем в буфер
-            if measurement is not None:
-                self.stream_measurements_buffer.append(measurement)
-                
-                # Если накопилось >100 измерений - усредняем и отправляем в регистры!
-                if len(self.stream_measurements_buffer) > 100:
-                    avg_measurement = sum(self.stream_measurements_buffer) / len(self.stream_measurements_buffer)
-                    
-                    # Отправляем в Input Register 30007-30008
-                    self.write_stream_result_to_input_registers(avg_measurement, 30007)
-                    
-                    # Выводим результат
-                    current_time = time.time()
-                    elapsed = current_time - self.stream_start_time
-                    frequency = self.stream_measurement_count / elapsed if elapsed > 0 else 0
-                    valid_count = len(self.stream_measurements_buffer)
-                    
-                    print(f" Поток датчика 4: {elapsed:5.1f}с | Измерений: {self.stream_measurement_count:6d} | "
-                          f"Частота: {frequency:7.1f} Гц | Усреднено {valid_count} измерений | "
-                          f"Среднее: {avg_measurement:.3f}мм")
-                    
-                    # Очищаем буфер для следующих 100 измерений
-                    self.stream_measurements_buffer = []
-                
-        except Exception as e:
-            print(f" Ошибка потокового режима датчика 4: {e}")
-            if self.stream_active_sensor4:
-                self.sensors.stop_stream_mode(4)
-                self.stream_active_sensor4 = False
-            self.current_state = SystemState.ERROR
-    
-    
     def write_stream_result_to_input_registers(self, value: float, base_address: int):
         """Запись результата потокового измерения в Input регистры"""
         try:
