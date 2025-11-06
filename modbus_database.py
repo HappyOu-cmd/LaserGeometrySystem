@@ -218,17 +218,30 @@ class ModbusDatabase:
             register_type: Тип регистра ('holding' или 'input')
             float_value: Float значение
             description: Описание регистра
+        
+        ВАЖНО: При записи в регистры используется порядок:
+        - setValues(3, addr_idx, [high_word]) - регистр address (40010) содержит high_word
+        - setValues(3, addr_idx+1, [low_word]) - регистр address+1 (40011) содержит low_word
+        Поэтому при сохранении в БД:
+        - address (40010) должен содержать high_word (value_high)
+        - address+1 (40011) должен содержать low_word (value_low)
         """
         # Конвертируем float в два 16-битных регистра
         low_word, high_word = self.float_to_doubleword(float_value)
         
-        # Сохраняем младший регистр
-        self.save_register(address, register_type, 0, low_word, float_value, 
-                          f"{description} (младший)")
-        
-        # Сохраняем старший регистр
-        self.save_register(address + 1, register_type, 0, high_word, 0.0, 
+        # ВАЖНО: При записи в регистры используется порядок:
+        # - Регистр address (40010) содержит high_word
+        # - Регистр address+1 (40011) содержит low_word
+        # Поэтому сохраняем в БД в том же порядке:
+        # Регистр address (40010) сохраняется с high_word (value_high) и low_word (value_low) для восстановления float
+        # Это позволяет восстановить float из пары регистров при загрузке
+        self.save_register(address, register_type, high_word, low_word, float_value, 
                           f"{description} (старший)")
+        
+        # Регистр address+1 (40011) сохраняется с low_word (value_low) и high_word (value_high) для восстановления float
+        # Оба регистра сохраняют полную информацию (high_word, low_word) для восстановления float
+        self.save_register(address + 1, register_type, high_word, low_word, float_value, 
+                          f"{description} (младший)")
     
     def save_float_pair(self, address_low: int, address_high: int, register_type: str,
                        float_value: float, float_name: str, description: str = "",

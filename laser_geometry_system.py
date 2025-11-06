@@ -9,6 +9,8 @@ import threading
 import struct
 import os
 import ctypes
+import math
+from queue import Queue, Empty
 from enum import Enum
 from typing import Optional, Tuple, List
 from collections import deque
@@ -102,6 +104,7 @@ class SystemState(Enum):
     CALIBRATE_BOTTOM = "CALIBRATE_BOTTOM"
     CALIBRATE_FLANGE = "CALIBRATE_FLANGE"
     CALIBRATE_HEIGHT = "CALIBRATE_HEIGHT"
+    CALIBRATE_FLANGE_DIAMETER = "CALIBRATE_FLANGE_DIAMETER"
     DEBUG_REGISTERS = "DEBUG_REGISTERS"
     
     # Измерение высоты
@@ -185,6 +188,12 @@ class LaserGeometrySystem:
         self.is_running = False
         self.calibration_in_progress = False
         self.stream_active_quad = False  # Флаг активного QUAD режима
+        
+        # Потоки для разделения чтения датчиков и обработки данных
+        self.sensor_reading_thread = None
+        self.sensor_data_queue = Queue(maxsize=1000)  # Очередь для передачи данных от датчиков
+        self.sensor_reading_active = False  # Флаг активности потока чтения датчиков
+        self.sensor_reading_lock = threading.Lock()  # Блокировка для синхронизации доступа к датчикам
         self.height_calibration_nonzero_count = 0  # Счетчик ненулевых показаний для CMD=103
         self.distance_to_plane_calculated = False  # Флаг завершения расчёта дистанции (CMD=103)
         self.recent_measurements = []  # Буфер последних измерений для CMD=103
@@ -225,6 +234,7 @@ class LaserGeometrySystem:
         self.cached_distance_to_center = None
         self.cached_distance_1_3 = None
         self.cached_distance_sensor4 = None
+        self.cached_distance_sensor3_to_center = None
         
         # Отслеживание смены для сброса счётчиков
         self.current_shift_number = 1  # Текущая смена
@@ -296,8 +306,8 @@ class LaserGeometrySystem:
             else:
                 # Очищаем буферы серийного порта после подключения
                 self.clear_serial_buffers()
-                print("OK Датчики подключены")
-                sensors_connected = True
+        print("OK Датчики подключены")
+        sensors_connected = True
         
         # Инициализация Modbus сервера (без GUI, так как у нас есть Debug GUI)
         self.modbus_server = ModbusSlaveServer(enable_gui=False)
@@ -343,6 +353,14 @@ class LaserGeometrySystem:
             self.debug_gui = ModbusDebugGUI(self.modbus_server)
             print("OK Debug GUI инициализирован с интеграцией БД")
         
+        # Запуск потока чтения датчиков ОТКЛЮЧЕН - используем прямое чтение с блокировкой
+        # Поток чтения датчиков можно включить позже, когда функции измерения будут использовать очередь
+        # if self.sensors and not self.test_mode:
+        #     self.sensor_reading_active = True
+        #     self.sensor_reading_thread = threading.Thread(target=self.sensor_reading_loop, daemon=True)
+        #     self.sensor_reading_thread.start()
+        #     print("OK Поток чтения датчиков запущен (высокий приоритет)")
+        
         # Запуск основного цикла в отдельном потоке
         self.is_running = True
         main_thread = threading.Thread(target=self.main_loop, daemon=True)
@@ -363,6 +381,16 @@ class LaserGeometrySystem:
         """Остановка системы"""
         print("\n ОСТАНОВКА СИСТЕМЫ")
         self.is_running = False
+        
+        # Остановка потока чтения датчиков
+        if self.sensor_reading_thread:
+            try:
+                self.sensor_reading_active = False
+                # Ждем завершения потока (максимум 1 секунда)
+                self.sensor_reading_thread.join(timeout=1.0)
+                print(" Остановлен поток чтения датчиков")
+            except Exception as e:
+                print(f" Ошибка остановки потока чтения датчиков: {e}")
         
         # Остановка QUAD потокового режима
         if self.sensors and self.stream_active_quad:
@@ -400,6 +428,122 @@ class LaserGeometrySystem:
         cleanup_laser_system_optimizations()
             
         print(" Система остановлена")
+    
+    def sensor_reading_loop(self):
+        """
+        Отдельный поток для чтения датчиков с высоким приоритетом
+        Только чтение данных, без обработки и записи в Modbus
+        """
+        print(" Запуск потока чтения датчиков...")
+        
+        # Устанавливаем высокий приоритет для потока чтения датчиков
+        if HAS_PSUTIL:
+            try:
+                thread_id = threading.current_thread().ident
+                if thread_id:
+                    # Устанавливаем высокий приоритет для текущего потока
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    THREAD_PRIORITY_HIGHEST = 2
+                    kernel32.SetThreadPriority(kernel32.OpenThread(0x1F03FF, False, thread_id), THREAD_PRIORITY_HIGHEST)
+                    print(" [SENSOR THREAD] Установлен высокий приоритет для потока чтения датчиков")
+            except Exception as e:
+                print(f" [SENSOR THREAD] Не удалось установить приоритет: {e}")
+        
+        try:
+            while self.sensor_reading_active and self.is_running:
+                if not self.sensors:
+                    time.sleep(0.01)  # Небольшая пауза если датчики не подключены
+                    continue
+                
+                # Читаем данные с датчиков (только чтение, без обработки)
+                try:
+                    with self.sensor_reading_lock:
+                        sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
+                            self.sensor_range_mm, self.sensor_range_mm, 
+                            self.sensor_range_mm, self.sensor_range_mm
+                        )
+                    
+                    # Помещаем данные в очередь (неблокирующая запись)
+                    try:
+                        self.sensor_data_queue.put_nowait({
+                            'sensor1': sensor1_mm,
+                            'sensor2': sensor2_mm,
+                            'sensor3': sensor3_mm,
+                            'sensor4': sensor4_mm,
+                            'timestamp': time.time()
+                        })
+                    except:
+                        # Очередь переполнена - удаляем старые данные и добавляем новые
+                        try:
+                            self.sensor_data_queue.get_nowait()
+                            self.sensor_data_queue.put_nowait({
+                                'sensor1': sensor1_mm,
+                                'sensor2': sensor2_mm,
+                                'sensor3': sensor3_mm,
+                                'sensor4': sensor4_mm,
+                                'timestamp': time.time()
+                            })
+                        except:
+                            pass  # Игнорируем ошибки при переполнении очереди
+                            
+                except Exception as e:
+                    # Ошибка чтения датчиков - небольшая пауза и продолжаем
+                    if self.sensor_reading_active:
+                        time.sleep(0.001)  # Минимальная пауза при ошибке
+                    continue
+                    
+        except Exception as e:
+            print(f" [SENSOR THREAD] Критическая ошибка в потоке чтения датчиков: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            print(" [SENSOR THREAD] Поток чтения датчиков завершен")
+    
+    def get_sensor_data(self, timeout=0.001):
+        """
+        Получение данных с датчиков из очереди (неблокирующее)
+        
+        Args:
+            timeout: Таймаут ожидания данных (секунды)
+            
+        Returns:
+            dict с данными датчиков или None если данных нет
+        """
+        try:
+            return self.sensor_data_queue.get(timeout=timeout)
+        except Empty:
+            return None
+    
+    def read_sensors_safe(self):
+        """
+        Безопасное чтение датчиков с блокировкой
+        Предотвращает конфликты при одновременном чтении из разных потоков
+        
+        Returns:
+            Tuple[sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm]
+        """
+        if not self.sensors:
+            return None, None, None, None
+        
+        try:
+            with self.sensor_reading_lock:
+                # Очищаем буферы серийного порта перед каждым чтением для предотвращения накопления старых данных
+                try:
+                    if hasattr(self.sensors.ser, 'reset_input_buffer'):
+                        self.sensors.ser.reset_input_buffer()
+                except:
+                    pass  # Игнорируем ошибки очистки
+                
+                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
+                    self.sensor_range_mm, self.sensor_range_mm, 
+                    self.sensor_range_mm, self.sensor_range_mm
+                )
+                # Убрана пауза - она может вызывать проблемы с синхронизацией
+                return sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm
+        except Exception as e:
+            print(f" [READ SENSORS] Ошибка чтения датчиков: {e}")
+            return None, None, None, None
     
     def main_loop(self):
         """Основной цикл системы"""
@@ -484,6 +628,26 @@ class LaserGeometrySystem:
     
     def handle_command(self, cmd: int):
         """Обработка команды и переход в соответствующее состояние"""
+        # Проверяем, идет ли активная калибровка (102 или 105)
+        # Если да, игнорируем команду 0 - не прерываем калибровку
+        if cmd == 0:
+            # Проверяем активные калибровки 102 и 105
+            is_calibration_active_102 = (
+                self.current_state == SystemState.CALIBRATE_FLANGE and 
+                hasattr(self, 'calibrate_flange_started') and 
+                not hasattr(self, 'calibrate_flange_completed')
+            )
+            is_calibration_active_105 = (
+                self.current_state == SystemState.CALIBRATE_FLANGE_DIAMETER and 
+                hasattr(self, 'calibrate_flange_diameter_started') and 
+                not hasattr(self, 'calibrate_flange_diameter_completed')
+            )
+            
+            if is_calibration_active_102 or is_calibration_active_105:
+                # Калибровка активна - игнорируем команду 0, не прерываем
+                print(f" [CMD=0] Игнорируем команду 0 - калибровка активна (завершение через несколько секунд)")
+                return  # Не обрабатываем команду 0, продолжаем калибровку
+        
         # Останавливаем все активные потоки при смене команды
         self.stop_all_streams()
         
@@ -506,6 +670,8 @@ class LaserGeometrySystem:
             self.current_state = SystemState.CALIBRATE_HEIGHT
         elif cmd == 104:
             self.current_state = SystemState.DEBUG_REGISTERS
+        elif cmd == 105:
+            self.current_state = SystemState.CALIBRATE_FLANGE_DIAMETER
             
         # Измерение верхней стенки
         elif cmd == 10:
@@ -611,6 +777,9 @@ class LaserGeometrySystem:
             elif current_state_value == "MEASURE_WALL_PROCESS" and new_cmd == 11:
                 # 10 → 11: команда на подсчёт верхней стенки
                 self.write_cycle_flag(11)
+                # Очищаем флаг начала измерения для возможности повторного запуска
+                if hasattr(self, '_wall_measurement_started'):
+                    delattr(self, '_wall_measurement_started')
                 print(" [10→11] Подсчёт результатов верхней стенки...")
                 
             elif current_state_value == "MEASURE_WALL_CALCULATE" and new_cmd == 12:
@@ -626,12 +795,30 @@ class LaserGeometrySystem:
                 self.cached_distance_to_center = None
                 self.cached_distance_1_3 = None
                 self.cached_distance_sensor4 = None
+                # ВАЖНО: Очищаем ВСЕ буферы измерения фланца перед началом нового измерения
                 print(" [11→12] Подсчёт завершён, начало измерения фланца, кеш очищен")
+                print(" [11→12] ОЧИСТКА БУФЕРОВ ИЗМЕРЕНИЯ ФЛАНЦА ПЕРЕД НОВЫМ ИЗМЕРЕНИЕМ")
+                # Очищаем буферы усредненных значений датчиков для фланца
+                self.sensor1_flange_measurements = []
+                self.sensor3_measurements = []
+                self.sensor4_measurements = []
+                self.temp_sensor1_flange_buffer = []
+                self.temp_sensor3_buffer = []
+                self.temp_sensor4_buffer = []
+                # Очищаем буферы рассчитанных значений для фланца
+                self.body_diameter_buffer = []
+                self.flange_diameter_buffer = []
+                self.flange_thickness_buffer = []
+                self.bottom_thickness_buffer = []
+                print(" [11→12] Все буферы измерения фланца очищены")
             
             # === ФЛАНЕЦ ===
             elif current_state_value == "MEASURE_FLANGE_PROCESS" and new_cmd == 13:
                 # 12 → 13: команда на подсчёт фланца
                 self.write_cycle_flag(13)
+                # Очищаем флаг начала измерения для возможности повторного запуска
+                if hasattr(self, '_flange_measurement_started'):
+                    delattr(self, '_flange_measurement_started')
                 print(" [12→13] Подсчёт результатов фланца...")
                 
             elif current_state_value == "MEASURE_FLANGE_CALCULATE" and new_cmd == 14:
@@ -643,12 +830,18 @@ class LaserGeometrySystem:
                 self.frequency_counter = 0
                 self.frequency_start_time = None
                 self.last_frequency_display = 0
+                # Сбрасываем флаг инициализации частоты для нижней стенки
+                if hasattr(self, '_bottom_frequency_initialized'):
+                    delattr(self, '_bottom_frequency_initialized')
                 print(" [13→14] Подсчёт завершён, начало измерения нижней стенки")
             
             # === НИЖНЯЯ СТЕНКА ===
             elif current_state_value == "MEASURE_BOTTOM_PROCESS" and new_cmd == 15:
                 # 14 → 15: команда на подсчёт нижней стенки
                 self.write_cycle_flag(15)
+                # Очищаем флаг начала измерения для возможности повторного запуска
+                if hasattr(self, '_bottom_measurement_started'):
+                    delattr(self, '_bottom_measurement_started')
                 print(" [14→15] Подсчёт результатов нижней стенки...")
                 
             elif current_state_value == "MEASURE_BOTTOM_CALCULATE" and new_cmd == 16:
@@ -691,12 +884,34 @@ class LaserGeometrySystem:
                 self.clear_serial_buffers()
                 print(" [104→0] Отладка регистров завершена, возврат в IDLE")
             
-            # === ЗАВЕРШЕНИЕ КАЛИБРОВОК 100/101/102 ===
-            elif current_state_value in ["CALIBRATE_WALL", "CALIBRATE_BOTTOM", "CALIBRATE_FLANGE"] and new_cmd == 0:
+            # === ЗАВЕРШЕНИЕ КАЛИБРОВОК 100/101/102/105 ===
+            # Проверяем, что калибровка завершена (не активна) перед переходом в IDLE
+            elif current_state_value in ["CALIBRATE_WALL", "CALIBRATE_BOTTOM", "CALIBRATE_FLANGE", "CALIBRATE_FLANGE_DIAMETER"] and new_cmd == 0:
+                # Для команд 102 и 105 проверяем, что калибровка завершена
+                if current_state_value == "CALIBRATE_FLANGE":
+                    # Команда 102 - проверяем, завершена ли калибровка
+                    if hasattr(self, 'calibrate_flange_started') and not hasattr(self, 'calibrate_flange_completed'):
+                        # Калибровка активна - не переходим в IDLE
+                        print(f" [CALIBRATE_FLANGE→0] Калибровка активна, ждем завершения...")
+                        return  # Не переходим в IDLE, продолжаем калибровку
+                
+                if current_state_value == "CALIBRATE_FLANGE_DIAMETER":
+                    # Команда 105 - проверяем, завершена ли калибровка
+                    if hasattr(self, 'calibrate_flange_diameter_started') and not hasattr(self, 'calibrate_flange_diameter_completed'):
+                        # Калибровка активна - не переходим в IDLE
+                        print(f" [CALIBRATE_FLANGE_DIAMETER→0] Калибровка активна, ждем завершения...")
+                        return  # Не переходим в IDLE, продолжаем калибровку
+                
+                # Калибровка завершена или не активна - переходим в IDLE
                 self.write_cycle_flag(0)
                 self.clear_measurement_buffers()
                 # Очищаем буферы серийного порта при переходе в IDLE
                 self.clear_serial_buffers()
+                # Очищаем флаги завершения калибровок
+                if hasattr(self, 'calibrate_flange_completed'):
+                    delattr(self, 'calibrate_flange_completed')
+                if hasattr(self, 'calibrate_flange_diameter_completed'):
+                    delattr(self, 'calibrate_flange_diameter_completed')
                 print(f" [{current_state_value}→0] Калибровка завершена, возврат в IDLE")
             
             # === ПРЕРЫВАНИЕ ЦИКЛА (ОШИБКИ) ===
@@ -980,7 +1195,7 @@ class LaserGeometrySystem:
                 },
                 {
                     'name': 'flange_diameter',
-                    'measured_regs': [(30052, 30053), (30054, 30055), (30056, 30057)],
+                    'measured_regs': [(30054, 30055), (30052, 30053), (30056, 30057)],  # макс, сред, мин
                     'base_regs': (40388, 40389),
                     'cond_bad_regs': (40390, 40391),
                     'bad_regs': (40392, 40393),
@@ -1079,8 +1294,9 @@ class LaserGeometrySystem:
             measurement_data['result'] = result
             
             # Сохраняем в БД
-            if self.modbus_server.db_integration:
-                self.modbus_server.db_integration.db.save_measurement_record(measurement_data)
+            # Отключено сохранение записей измерений в БД - сохраняем только указанные величины
+            # if self.modbus_server.db_integration:
+            #     self.modbus_server.db_integration.db.save_measurement_record(measurement_data)
             
             return result
             
@@ -1168,10 +1384,12 @@ class LaserGeometrySystem:
                 base_offset = 30000
             
             # Вычисляем индексы (ВАЖНО: 40001 = индекс 1, 30001 = индекс 1 в pymodbus)
-            first_idx = reg_pair[0] - base_offset
-            second_idx = reg_pair[1] - base_offset
+            # При записи: base_address - 1 = младшее слово, base_address = старшее слово
+            # При чтении: reg_pair[0] = base_address = старшее слово, reg_pair[0] - 1 = младшее слово
+            first_idx = reg_pair[0] - base_offset      # Старшее слово (base_address)
+            second_idx = reg_pair[0] - base_offset - 1  # Младшее слово (base_address - 1)
             
-            # Читаем значения (В HMI: первый регистр = СТАРШЕЕ слово, второй = МЛАДШЕЕ)
+            # Читаем значения (В HMI: base_address = старшее слово, base_address - 1 = младшее слово)
             high_word = self.modbus_server.slave_context.getValues(function_code, first_idx, 1)[0]
             low_word = self.modbus_server.slave_context.getValues(function_code, second_idx, 1)[0]
             
@@ -1277,6 +1495,41 @@ class LaserGeometrySystem:
             # Игнорируем ошибки очистки буферов
             pass
     
+    def is_valid_measurement(self, value: float, max_range: float = None, min_range: float = None) -> bool:
+        """
+        Проверка валидности измерения датчика
+        
+        Args:
+            value: Значение измерения в мм
+            max_range: Максимальный диапазон датчика (по умолчанию sensor_range_mm * 2)
+            min_range: Минимальный диапазон датчика (по умолчанию 20 мм - базовое расстояние)
+        
+        Returns:
+            True если значение валидно, False если некорректно (None, 0, отрицательное, вне диапазона)
+        """
+        if value is None:
+            return False
+        if value <= 0.0:
+            return False  # Нулевые и отрицательные значения некорректны
+        
+        # Устанавливаем минимальный диапазон (базовое расстояние датчика - 20 мм)
+        if min_range is None:
+            min_range = 20.0  # Базовое расстояние датчика
+        
+        # Проверяем минимальный диапазон
+        if value < min_range:
+            return False  # Значение меньше минимального диапазона
+        
+        # Устанавливаем максимальный диапазон
+        if max_range is None:
+            max_range = self.sensor_range_mm * 2.0  # Максимальный диапазон (25 * 2 = 50 мм)
+        
+        # Проверяем максимальный диапазон
+        if value > max_range:
+            return False  # Значение вне диапазона датчика
+        
+        return True
+    
     def clear_measurement_buffers(self):
         """Очистка буферов измерений"""
         # Очищаем основной буфер калибровок (measurement_buffer)
@@ -1302,13 +1555,14 @@ class LaserGeometrySystem:
         self.temp_sensor1_buffer = []
         self.temp_sensor2_buffer = []
         
-        # Буферы команды 11
+        # Буферы команды 11 (фланец)
         self.sensor1_flange_measurements = []
         self.sensor3_measurements = []
         self.sensor4_measurements = []
         self.temp_sensor1_flange_buffer = []
         self.temp_sensor3_buffer = []
         self.temp_sensor4_buffer = []
+        # Буферы диаметров и толщин - очищаем при каждом новом измерении
         self.body_diameter_buffer = []
         self.flange_diameter_buffer = []
         self.flange_thickness_buffer = []
@@ -1352,12 +1606,15 @@ class LaserGeometrySystem:
             self.handle_calibrate_flange_state()
         elif self.current_state == SystemState.CALIBRATE_HEIGHT:
             self.handle_calibrate_height_state()
+        elif self.current_state == SystemState.CALIBRATE_FLANGE_DIAMETER:
+            self.handle_calibrate_flange_diameter_state()
         elif self.current_state == SystemState.DEBUG_REGISTERS:
             self.handle_debug_registers_state()
             
-        # Измерение высоты
-        elif self.current_state == SystemState.MEASURE_HEIGHT_PROCESS:
-            self.handle_measure_height_process_state()
+        # Измерение высоты - ОТКЛЮЧЕНО: расчет высоты производится на ПЛК
+        # Регистр 40057-40058 записывается только ПЛК/HMI
+        # elif self.current_state == SystemState.MEASURE_HEIGHT_PROCESS:
+        #     self.handle_measure_height_process_state()
             
         # Основной цикл измерения - верхняя стенка
         elif self.current_state == SystemState.MEASURE_WALL_PROCESS:
@@ -1432,7 +1689,9 @@ class LaserGeometrySystem:
             
             # Логика поиска 3 ненулевых показаний из последних 5 измерений
             # Добавляем текущее измерение в буфер (храним последние 5)
-            self.recent_measurements.append(sensor1_mm)
+            # Фильтруем некорректные измерения перед добавлением
+            if self.is_valid_measurement(sensor1_mm):
+                self.recent_measurements.append(sensor1_mm)
             if len(self.recent_measurements) > 5:
                 self.recent_measurements.pop(0)  # Удаляем самое старое
             
@@ -1512,6 +1771,171 @@ class LaserGeometrySystem:
         except Exception as e:
             print(f" Ошибка отладки регистров (CMD=104): {e}")
             self.current_state = SystemState.ERROR
+    
+    def handle_calibrate_flange_diameter_state(self):
+        """
+        CMD=105: Калибровка диаметра фланца
+        - Читаем эталонный диаметр фланца из регистров 40030-40031
+        - Измеряем датчик 3 в течение 5 секунд и усредняем
+        - Вычисляем: Расстояние между датчиком 3 и центром = (Эталонный диаметр фланца/2) + среднее датчика 3
+        - Записываем результат в регистры 40032-40033
+        - Обновляем статус: 105 (калибровка) → 935 (завершено), ожидаем CMD=0
+        """
+        if not self.sensors:
+            print(" [CMD=105] Ошибка: датчики не подключены!")
+            self.current_state = SystemState.ERROR
+            return
+        
+        try:
+            # Инициализация при первом запуске (всегда сбрасываем время при новом запуске)
+            if not hasattr(self, 'calibrate_flange_diameter_started') or not hasattr(self, 'calibrate_flange_diameter_start_time'):
+                self.calibrate_flange_diameter_started = True
+                self.calibrate_flange_diameter_measurement_duration = 5.0  # 5 секунд
+                self.calibrate_flange_diameter_start_time = time.time()
+                self.calibrate_flange_diameter_sensor3_buffer = []
+                self.calibrate_flange_diameter_measurement_count = 0
+                
+                # Очищаем буферы серийного порта перед началом измерений
+                self.clear_serial_buffers()
+                
+                # Очищаем буфер датчика 3
+                self.measurement_buffer['sensor3'].clear()
+                
+                # Читаем эталонный диаметр фланца из регистров 40030-40031
+                reference_flange_diameter = self.read_reference_flange_diameter()
+                print(f" [CMD=105] Начало калибровки диаметра фланца")
+                print(f" [CMD=105] Эталонный диаметр фланца: {reference_flange_diameter:.3f} мм")
+                
+                if reference_flange_diameter <= 0:
+                    print(f" [CMD=105] ОШИБКА: Эталонный диаметр фланца должен быть больше 0!")
+                    self.current_state = SystemState.ERROR
+                    return
+                
+                # Устанавливаем статус калибровки
+                self.write_cycle_flag(105)
+                print(f" [CMD=105] Измерение датчика 3 в течение 5 секунд...")
+                print(f" [CMD=105] ВНИМАНИЕ: Калибровка не будет прервана даже при команде 0 до завершения 5 секунд!")
+            
+            # Проверяем, не завершена ли уже калибровка
+            if hasattr(self, 'calibrate_flange_diameter_completed'):
+                return  # Калибровка уже завершена, просто выходим
+            
+            # Измеряем датчик 3 в течение 5 секунд
+            current_time = time.time()
+            elapsed = current_time - self.calibrate_flange_diameter_start_time
+            
+            if elapsed < self.calibrate_flange_diameter_measurement_duration:
+                # Устанавливаем статус 105 во время измерения (пока не закончится калибровка)
+                self.write_cycle_flag(105)
+                
+                # Выполняем QUAD измерение (но используем только датчик 3)
+                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
+                    self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
+                )
+                
+                # Сохраняем только измерения датчика 3
+                # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
+                if self.is_valid_measurement(sensor3_mm):
+                    self.measurement_buffer['sensor3'].append(sensor3_mm)
+                    self.calibrate_flange_diameter_sensor3_buffer.append(sensor3_mm)
+                    self.calibrate_flange_diameter_measurement_count += 1
+                
+                # Показываем прогресс каждую секунду
+                if int(elapsed) != int(elapsed - 0.1):  # Каждую секунду
+                    print(f" [CMD=105] Время: {elapsed:.1f}с, Измерений датчика 3: {self.calibrate_flange_diameter_measurement_count}")
+            else:
+                # Измерения завершены - вычисляем результат
+                # Проверяем, что прошло достаточно времени и есть измерения
+                if elapsed < 0.1:
+                    # Слишком рано - еще не успели накопить данные, продолжаем измерения
+                    return
+                
+                if len(self.calibrate_flange_diameter_sensor3_buffer) == 0:
+                    print(f" [CMD=105] ОШИБКА: Не получено измерений от датчика 3!")
+                    print(f" [CMD=105] Прошло времени: {elapsed:.3f}с, Измерений: {self.calibrate_flange_diameter_measurement_count}")
+                    self.current_state = SystemState.ERROR
+                    return
+                
+                # Устанавливаем флаг завершения, чтобы не выполнять расчеты повторно
+                self.calibrate_flange_diameter_completed = True
+                
+                # Усредняем измерения датчика 3
+                avg_sensor3 = sum(self.calibrate_flange_diameter_sensor3_buffer) / len(self.calibrate_flange_diameter_sensor3_buffer)
+                print(f" [CMD=105] Среднее значение датчика 3: {avg_sensor3:.3f} мм (из {len(self.calibrate_flange_diameter_sensor3_buffer)} измерений)")
+                
+                # Читаем эталонный диаметр фланца
+                reference_flange_diameter = self.read_reference_flange_diameter()
+                
+                # Вычисляем расстояние между датчиком 3 и центром пересечения
+                # Формула: (Эталонный диаметр фланца/2) + среднее датчика 3
+                distance_sensor3_to_center = reference_flange_diameter  + avg_sensor3
+                print(f" [CMD=105] Расстояние между датчиком 3 и центром: {distance_sensor3_to_center:.3f} мм")
+                print(f" [CMD=105] Формула: ({reference_flange_diameter:.3f} / 2) + {avg_sensor3:.3f} = {distance_sensor3_to_center:.3f}")
+                
+                # Записываем результат в регистры 40032-40033
+                self.write_distance_sensor3_to_center(distance_sensor3_to_center)
+                
+                # Кешируем результат
+                self.cached_distance_sensor3_to_center = distance_sensor3_to_center
+                
+                # Устанавливаем статус завершения
+                self.write_cycle_flag(935)
+                
+                print(f" [CMD=105] КАЛИБРОВКА ДИАМЕТРА ФЛАНЦА ЗАВЕРШЕНА")
+                print(f" [CMD=105] Результат записан в регистры 40032-40033: {distance_sensor3_to_center:.3f} мм")
+                
+                # Очищаем флаги (всегда очищаем при завершении, чтобы можно было запустить заново)
+                if hasattr(self, 'calibrate_flange_diameter_started'):
+                    delattr(self, 'calibrate_flange_diameter_started')
+                if hasattr(self, 'calibrate_flange_diameter_start_time'):
+                    delattr(self, 'calibrate_flange_diameter_start_time')
+                if hasattr(self, 'calibrate_flange_diameter_completed'):
+                    delattr(self, 'calibrate_flange_diameter_completed')
+                
+                # Автоматически переходим в IDLE после завершения калибровки
+                self.write_cycle_flag(0)
+                self.clear_measurement_buffers()
+                self.clear_serial_buffers()
+                self.current_state = SystemState.IDLE
+                self.reset_command()
+                print(f" [CMD=105] Автоматический переход в IDLE")
+                
+        except Exception as e:
+            print(f" [CMD=105] Ошибка калибровки диаметра фланца: {e}")
+            import traceback
+            traceback.print_exc()
+            self.current_state = SystemState.ERROR
+    
+    def read_reference_flange_diameter(self) -> float:
+        """Чтение эталонного диаметра фланца из регистров 40030, 40031"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                # HMI: старшее слово в 40030, младшее в 40031
+                values = self.modbus_server.slave_context.getValues(3, 30, 2)  # 40030-40031 -> индексы 29-30
+                if values and len(values) >= 2:
+                    high_word = int(values[0])  # 40030 - старший
+                    low_word = int(values[1])  # 40031 - младший
+                    diameter = self.doubleword_to_float(low_word, high_word)
+                    return diameter
+        except Exception as e:
+            print(f" [CMD=105] Ошибка чтения эталонного диаметра фланца: {e}")
+        return 0.0
+    
+    def write_distance_sensor3_to_center(self, distance: float):
+        """Запись расстояния между датчиком 3 и центром в регистры 40032, 40033"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                low_word, high_word = self.float_to_doubleword(distance)
+                # HMI читает: старшее слово из 40032, младшее из 40033
+                self.modbus_server.slave_context.setValues(3, 32, [int(high_word)])  # 40032 - старший (индекс 31)
+                self.modbus_server.slave_context.setValues(3, 33, [int(low_word)])   # 40033 - младший (индекс 32)
+                # Сохранение в БД
+                # Отключено сохранение в БД - сохраняем только указанные величины
+                # if self.db_integration:
+                #     self.db_integration.save_doubleword_register(40032, 'holding', distance, 'Расстояние датчик 3 - центр')
+                print(f" [CMD=105] Записано расстояние датчик 3 - центр 40032-40033: {distance:.3f} мм (high: {int(high_word)}, low: {int(low_word)})")
+        except Exception as e:
+            print(f" [CMD=105] Ошибка записи расстояния датчик 3 - центр: {e}")
 
     def read_register_40020_raw(self):
         """Чтение сырых и обработанных данных регистров 40052-40053"""
@@ -1575,8 +1999,9 @@ class LaserGeometrySystem:
                 self.modbus_server.slave_context.setValues(3, 55, [int(high_word)])  # 40055 - старший
                 self.modbus_server.slave_context.setValues(3, 56, [int(low_word)])   # 40056 - младший
                 # Сохранение в БД
-                if self.db_integration:
-                    self.db_integration.save_doubleword_register(40055, 'holding', distance, 'Дистанция до плоскости')
+                # Отключено сохранение в БД - сохраняем только указанные величины
+                # if self.db_integration:
+                #     self.db_integration.save_doubleword_register(40055, 'holding', distance, 'Дистанция до плоскости')
                 print(f" Записана дистанция до плоскости 40055-40056: {distance:.3f} мм (high: {int(high_word)}, low: {int(low_word)})")
         except Exception as e:
             print(f" Ошибка записи дистанции до плоскости: {e}")
@@ -1641,13 +2066,20 @@ class LaserGeometrySystem:
             # 9. Сбрасываем команду в 0, чтобы избежать повторного запуска
             self.reset_command()
             
+            # 10. Очищаем буферы после калибровки
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
+            
             print(" КАЛИБРОВКА СТЕНКИ ЗАВЕРШЕНА")
             
         except Exception as e:
             print(f" Ошибка калибровки: {e}")
             self.current_state = SystemState.ERROR
-                            # Сбрасываем команду даже при ошибке
+            # Сбрасываем команду даже при ошибке
             self.reset_command()
+            # Очищаем буферы даже при ошибке
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
         finally:
             self.calibration_in_progress = False
     
@@ -1686,6 +2118,10 @@ class LaserGeometrySystem:
             # 7. Сбрасываем команду в 0, чтобы избежать повторного запуска
             self.reset_command()
             
+            # 8. Очищаем буферы после калибровки
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
+            
             print(" КАЛИБРОВКА ДНА ЗАВЕРШЕНА")
             
         except Exception as e:
@@ -1693,53 +2129,145 @@ class LaserGeometrySystem:
             self.current_state = SystemState.ERROR
             # Сбрасываем команду даже при ошибке
             self.reset_command()
+            # Очищаем буферы даже при ошибке
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
         finally:
             self.calibration_in_progress = False
     
     def handle_calibrate_flange_state(self):
-        """Обработка калибровки фланца (CMD = 102)"""
-        if self.calibration_in_progress:
+        """
+        CMD=102: Калибровка эталонного диаметра (фланца)
+        - Читаем эталонный диаметр из регистров 40006-40007
+        - Измеряем датчик 1 в течение 5 секунд и усредняем
+        - Вычисляем: Расстояние между датчиком 1 и центром = (Эталонный диаметр/2) + среднее датчика 1
+        - Записываем результат в регистры 40016-40017
+        - Обновляем статус: 102 (калибровка) → 932 (завершено), ожидаем CMD=0
+        """
+        if not self.sensors:
+            print(" [CMD=102] Ошибка: датчики не подключены!")
+            self.current_state = SystemState.ERROR
             return
-            
-        print("🔧 НАЧАЛО КАЛИБРОВКИ ФЛАНЦА")
-        self.calibration_in_progress = True
         
         try:
-            # 1. Читаем эталонный диаметр из регистров 40006, 40007
-            reference_diameter = self.read_reference_diameter()
-            print(f" Эталонный диаметр: {reference_diameter:.3f} мм")
+            # Инициализация при первом запуске (всегда сбрасываем время при новом запуске)
+            if not hasattr(self, 'calibrate_flange_started') or not hasattr(self, 'calibrate_flange_start_time'):
+                self.calibrate_flange_started = True
+                self.calibrate_flange_measurement_duration = 5.0  # 5 секунд
+                self.calibrate_flange_start_time = time.time()
+                self.calibrate_flange_sensor1_buffer = []
+                self.calibrate_flange_measurement_count = 0
+                
+                # Очищаем буферы серийного порта перед началом измерений
+                self.clear_serial_buffers()
+                
+                # Очищаем буфер датчика 1
+                self.measurement_buffer['sensor1'].clear()
+                
+                # Читаем эталонный диаметр из регистров 40006-40007
+                reference_diameter = self.read_reference_diameter()
+                print(f" [CMD=102] Начало калибровки эталонного диаметра")
+                print(f" [CMD=102] Эталонный диаметр: {reference_diameter:.3f} мм")
+                
+                if reference_diameter <= 0:
+                    print(f" [CMD=102] ОШИБКА: Эталонный диаметр должен быть больше 0!")
+                    self.current_state = SystemState.ERROR
+                    return
+                
+                # Устанавливаем статус калибровки
+                self.write_cycle_flag(102)
+                print(f" [CMD=102] Измерение датчика 1 в течение 5 секунд...")
+                print(f" [CMD=102] ВНИМАНИЕ: Калибровка не будет прервана даже при команде 0 до завершения 5 секунд!")
             
-            # 2. Измеряем датчиком 1 не менее 4 секунд
-            print(" Измерение датчиком 1 в течение 4 секунд...")
-            self.measure_sensor1_for_calibration()
+            # Проверяем, не завершена ли уже калибровка
+            if hasattr(self, 'calibrate_flange_completed'):
+                return  # Калибровка уже завершена, просто выходим
             
-            # 3. Усредняем измерения датчика 1
-            avg_sensor1 = self.calculate_sensor1_average()
-            print(f" Среднее значение датчика 1: {avg_sensor1:.3f} мм")
+            # Измеряем датчик 1 в течение 5 секунд
+            current_time = time.time()
+            elapsed = current_time - self.calibrate_flange_start_time
             
-            # 4. Вычисляем расстояние от датчика 1 до центра
-            # Формула: Расстояние датчик 1 - центр = Эталонный диаметр + измерение датчика 1
-            distance_1_center = reference_diameter + avg_sensor1
-            print(f" Расстояние от датчика 1 до центра: {distance_1_center:.3f} мм")
-            
-            # 5. Записываем результат в регистры 40016, 40017
-            self.write_calibration_result_1_center(distance_1_center)
-            
-            # 6. Сохраняем в локальных данных
-            self.calibration_data['flange_distance_1_center'] = distance_1_center
-            
-            # 7. Сбрасываем команду в 0, чтобы избежать повторного запуска
-            self.reset_command()
-            
-            print(" КАЛИБРОВКА ФЛАНЦА ЗАВЕРШЕНА")
-            
+            if elapsed < self.calibrate_flange_measurement_duration:
+                # Выполняем QUAD измерение (но используем только датчик 1)
+                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
+                    self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
+                )
+                
+                # Сохраняем только измерения датчика 1
+                # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
+                if self.is_valid_measurement(sensor1_mm):
+                    self.measurement_buffer['sensor1'].append(sensor1_mm)
+                    self.calibrate_flange_sensor1_buffer.append(sensor1_mm)
+                    self.calibrate_flange_measurement_count += 1
+                
+                # Показываем прогресс каждую секунду
+                if int(elapsed) != int(elapsed - 0.1):  # Каждую секунду
+                    print(f" [CMD=102] Время: {elapsed:.1f}с, Измерений датчика 1: {self.calibrate_flange_measurement_count}")
+            else:
+                # Измерения завершены - вычисляем результат
+                # Проверяем, что прошло достаточно времени и есть измерения
+                if elapsed < 0.1:
+                    # Слишком рано - еще не успели накопить данные, продолжаем измерения
+                    return
+                
+                if len(self.calibrate_flange_sensor1_buffer) == 0:
+                    print(f" [CMD=102] ОШИБКА: Не получено измерений от датчика 1!")
+                    print(f" [CMD=102] Прошло времени: {elapsed:.3f}с, Измерений: {self.calibrate_flange_measurement_count}")
+                    self.current_state = SystemState.ERROR
+                    return
+                
+                # Устанавливаем флаг завершения, чтобы не выполнять расчеты повторно
+                self.calibrate_flange_completed = True
+                
+                # Усредняем измерения датчика 1
+                avg_sensor1 = sum(self.calibrate_flange_sensor1_buffer) / len(self.calibrate_flange_sensor1_buffer)
+                print(f" [CMD=102] Среднее значение датчика 1: {avg_sensor1:.3f} мм (из {len(self.calibrate_flange_sensor1_buffer)} измерений)")
+                
+                # Читаем эталонный диаметр
+                reference_diameter = self.read_reference_diameter()
+                
+                # Вычисляем расстояние между датчиком 1 и центром пересечения
+                # Формула: (Эталонный диаметр/2) + среднее датчика 1
+                distance_1_center = reference_diameter  + avg_sensor1
+                print(f" [CMD=102] Расстояние между датчиком 1 и центром: {distance_1_center:.3f} мм")
+                print(f" [CMD=102] Формула: ({reference_diameter:.3f} / 2) + {avg_sensor1:.3f} = {distance_1_center:.3f}")
+                
+                # Записываем результат в регистры 40016-40017
+                self.write_calibration_result_1_center(distance_1_center)
+                
+                # Кешируем результат
+                self.cached_distance_to_center = distance_1_center
+                
+                # Сохраняем в локальных данных
+                self.calibration_data['flange_distance_1_center'] = distance_1_center
+                
+                # Устанавливаем статус завершения
+                self.write_cycle_flag(932)
+                
+                print(f" [CMD=102] КАЛИБРОВКА ЭТАЛОННОГО ДИАМЕТРА ЗАВЕРШЕНА")
+                print(f" [CMD=102] Результат записан в регистры 40016-40017: {distance_1_center:.3f} мм")
+                
+                # Очищаем флаги (всегда очищаем при завершении, чтобы можно было запустить заново)
+                if hasattr(self, 'calibrate_flange_started'):
+                    delattr(self, 'calibrate_flange_started')
+                if hasattr(self, 'calibrate_flange_start_time'):
+                    delattr(self, 'calibrate_flange_start_time')
+                if hasattr(self, 'calibrate_flange_completed'):
+                    delattr(self, 'calibrate_flange_completed')
+                
+                # Автоматически переходим в IDLE после завершения калибровки
+                self.write_cycle_flag(0)
+                self.clear_measurement_buffers()
+                self.clear_serial_buffers()
+                self.current_state = SystemState.IDLE
+                self.reset_command()
+                print(f" [CMD=102] Автоматический переход в IDLE")
+                
         except Exception as e:
-            print(f" Ошибка калибровки фланца: {e}")
+            print(f" [CMD=102] Ошибка калибровки эталонного диаметра: {e}")
+            import traceback
+            traceback.print_exc()
             self.current_state = SystemState.ERROR
-            # Сбрасываем команду даже при ошибке
-            self.reset_command()
-        finally:
-            self.calibration_in_progress = False
     
     def read_reference_thickness(self) -> float:
         """Чтение толщины эталона из регистров 40002, 40003"""
@@ -1787,13 +2315,31 @@ class LaserGeometrySystem:
                     self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
                 )
                 
-                # Сохраняем только валидные измерения
-                if all(v is not None for v in [sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm]):
+                # Сохраняем только валидные измерения для калибровки стенки
+                # Для калибровки стенки нужны только датчики 1, 2 и 3 (датчик 4 не используется)
+                # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
+                if (self.is_valid_measurement(sensor1_mm) and 
+                    self.is_valid_measurement(sensor2_mm) and 
+                    self.is_valid_measurement(sensor3_mm)):
+                    # Датчик 4 не обязателен для калибровки стенки, но сохраняем если валиден
                     self.measurement_buffer['sensor1'].append(sensor1_mm)
                     self.measurement_buffer['sensor2'].append(sensor2_mm)
                     self.measurement_buffer['sensor3'].append(sensor3_mm)
-                    self.measurement_buffer['sensor4'].append(sensor4_mm)
+                    if self.is_valid_measurement(sensor4_mm):
+                        self.measurement_buffer['sensor4'].append(sensor4_mm)
                     measurement_count += 1
+                else:
+                    # Отладочный вывод: показываем, почему измерения не прошли валидацию
+                    if measurement_count == 0 and int((time.time() - start_time)) % 2 == 0:  # Раз в 2 секунды
+                        invalid_reasons = []
+                        if not self.is_valid_measurement(sensor1_mm):
+                            invalid_reasons.append(f"Д1={sensor1_mm}")
+                        if not self.is_valid_measurement(sensor2_mm):
+                            invalid_reasons.append(f"Д2={sensor2_mm}")
+                        if not self.is_valid_measurement(sensor3_mm):
+                            invalid_reasons.append(f"Д3={sensor3_mm}")
+                        if invalid_reasons:
+                            print(f" ⚠ Некорректные измерения: {', '.join(invalid_reasons)}")
                 
                 # Показываем прогресс каждую секунду
                 elapsed = time.time() - start_time
@@ -1831,11 +2377,11 @@ class LaserGeometrySystem:
                 self.modbus_server.slave_context.setValues(3, 10, [int(high_word)])  # 40010 - старший регистр
                 self.modbus_server.slave_context.setValues(3, 11, [int(low_word)])   # 40011 - младший регистр
                 
-                # Сохраняем в базу данных
-                if self.db_integration:
-                    self.db_integration.save_doubleword_register(
-                        40010, 'holding', distance, 'Расстояние между датчиками 1,2'
-                    )
+                # Отключено сохранение в БД - сохраняем только указанные величины
+                # if self.db_integration:
+                #     self.db_integration.save_doubleword_register(
+                #         40010, 'holding', distance, 'Расстояние между датчиками 1,2'
+                #     )
                 
                 print(f" Результат 1,2 записан в регистры 40010, 40011: {distance:.3f} мм (high: {int(high_word)}, low: {int(low_word)})")
         except Exception as e:
@@ -1853,11 +2399,11 @@ class LaserGeometrySystem:
                 self.modbus_server.slave_context.setValues(3, 12, [int(high_word)])  # 40012 - старший регистр
                 self.modbus_server.slave_context.setValues(3, 13, [int(low_word)])   # 40013 - младший регистр
                 
-                # Сохраняем в базу данных
-                if self.db_integration:
-                    self.db_integration.save_doubleword_register(
-                        40012, 'holding', distance, 'Расстояние между датчиками 1,3'
-                    )
+                # Отключено сохранение в БД - сохраняем только указанные величины
+                # if self.db_integration:
+                #     self.db_integration.save_doubleword_register(
+                #         40012, 'holding', distance, 'Расстояние между датчиками 1,3'
+                #     )
                 
                 print(f" Результат 1,3 записан в регистры 40012, 40013: {distance:.3f} мм (high: {int(high_word)}, low: {int(low_word)})")
         except Exception as e:
@@ -1907,7 +2453,8 @@ class LaserGeometrySystem:
                 )
                 
                 # Сохраняем только измерения датчика 4
-                if sensor4_mm is not None:
+                # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
+                if self.is_valid_measurement(sensor4_mm):
                     self.measurement_buffer['sensor4'].append(sensor4_mm)
                     measurement_count += 1
                 
@@ -1942,11 +2489,11 @@ class LaserGeometrySystem:
                 self.modbus_server.slave_context.setValues(3, 14, [int(high_word)])  # 40014 - старший регистр
                 self.modbus_server.slave_context.setValues(3, 15, [int(low_word)])   # 40015 - младший регистр
                 
-                # Сохраняем в базу данных
-                if self.db_integration:
-                    self.db_integration.save_doubleword_register(
-                        40014, 'holding', distance, 'Расстояние датчика 4 до поверхности'
-                    )
+                # Отключено сохранение в БД - сохраняем только указанные величины
+                # if self.db_integration:
+                #     self.db_integration.save_doubleword_register(
+                #         40014, 'holding', distance, 'Расстояние датчика 4 до поверхности'
+                #     )
                 
                 print(f" Результат датчика 4 записан в регистры 40014, 40015: {distance:.3f} мм (high: {int(high_word)}, low: {int(low_word)})")
         except Exception as e:
@@ -1996,7 +2543,8 @@ class LaserGeometrySystem:
                 )
                 
                 # Сохраняем только измерения датчика 1
-                if sensor1_mm is not None:
+                # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
+                if self.is_valid_measurement(sensor1_mm):
                     self.measurement_buffer['sensor1'].append(sensor1_mm)
                     measurement_count += 1
                 
@@ -2031,11 +2579,11 @@ class LaserGeometrySystem:
                 self.modbus_server.slave_context.setValues(3, 16, [int(high_word)])  # 40016 - старший регистр
                 self.modbus_server.slave_context.setValues(3, 17, [int(low_word)])   # 40017 - младший регистр
                 
-                # Сохраняем в базу данных
-                if self.db_integration:
-                    self.db_integration.save_doubleword_register(
-                        40016, 'holding', distance, 'Расстояние датчика 1 до центра'
-                    )
+                # Отключено сохранение в БД - сохраняем только указанные величины
+                # if self.db_integration:
+                #     self.db_integration.save_doubleword_register(
+                #         40016, 'holding', distance, 'Расстояние датчика 1 до центра'
+                #     )
                 
                 print(f" Результат датчика 1 записан в регистры 40016, 40017: {distance:.3f} мм (high: {int(high_word)}, low: {int(low_word)})")
         except Exception as e:
@@ -2080,10 +2628,8 @@ class LaserGeometrySystem:
             # Статус уже установлен в manage_measurement_cycle_flag
             # Просто продолжаем сбор данных
             
-            # Выполняем QUAD измерение датчиков 1 и 2 (как в main.py)
-            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-            )
+            # Выполняем QUAD измерение датчиков 1 и 2 (безопасное чтение с блокировкой)
+            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
             
             # Увеличиваем счетчик измерений
             self.frequency_counter += 1
@@ -2097,17 +2643,37 @@ class LaserGeometrySystem:
                     print(f" [CMD=10] Частота опроса: {instant_freq:.1f} Гц | Измерений: {self.frequency_counter}")
                 self.last_frequency_display = current_time
             
-            # Проверяем что получили данные от датчиков 1 и 2
-            if sensor1_mm is not None and sensor2_mm is not None:
+            # Проверяем что получили валидные данные от датчиков 1 и 2
+            # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
+            if (self.is_valid_measurement(sensor1_mm) and self.is_valid_measurement(sensor2_mm)):
                 # Добавляем в временные буферы для усреднения
                 self.temp_sensor1_buffer.append(sensor1_mm)
                 self.temp_sensor2_buffer.append(sensor2_mm)
                 
                 # Когда накопилось 10 измерений - усредняем и записываем
                 if len(self.temp_sensor1_buffer) >= 10:
-                    # Вычисляем средние значения
-                    avg_sensor1 = sum(self.temp_sensor1_buffer) / len(self.temp_sensor1_buffer)
-                    avg_sensor2 = sum(self.temp_sensor2_buffer) / len(self.temp_sensor2_buffer)
+                    # Фильтруем аномальные значения перед усреднением (используем медианный фильтр)
+                    sorted_sensor1 = sorted(self.temp_sensor1_buffer)
+                    sorted_sensor2 = sorted(self.temp_sensor2_buffer)
+                    
+                    # Вычисляем медиану
+                    median_sensor1 = (sorted_sensor1[4] + sorted_sensor1[5]) / 2.0
+                    median_sensor2 = (sorted_sensor2[4] + sorted_sensor2[5]) / 2.0
+                    
+                    # Фильтруем значения, которые отклоняются от медианы более чем на 1.5мм
+                    filtered_sensor1 = [v for v in self.temp_sensor1_buffer if abs(v - median_sensor1) <= 1.5]
+                    filtered_sensor2 = [v for v in self.temp_sensor2_buffer if abs(v - median_sensor2) <= 1.5]
+                    
+                    # Если после фильтрации осталось менее 5 значений - используем медиану
+                    if len(filtered_sensor1) >= 5:
+                        avg_sensor1 = sum(filtered_sensor1) / len(filtered_sensor1)
+                    else:
+                        avg_sensor1 = median_sensor1
+                    
+                    if len(filtered_sensor2) >= 5:
+                        avg_sensor2 = sum(filtered_sensor2) / len(filtered_sensor2)
+                    else:
+                        avg_sensor2 = median_sensor2
                     
                     # Добавляем усредненные значения в основные буферы
                     self.sensor1_measurements.append(avg_sensor1)
@@ -2199,6 +2765,20 @@ class LaserGeometrySystem:
             print(f" Ошибка чтения расстояния датчика 4: {e}")
         return None
     
+    def read_calibrated_distance_sensor3_to_center(self) -> float:
+        """Чтение калиброванного расстояния датчика 3 до центра из регистров 40032, 40033"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                values = self.modbus_server.slave_context.getValues(3, 32, 2)  # 40032-40033 -> индексы 32-33
+                if values and len(values) >= 2:
+                    high_word = int(values[0])  # 40032 - старший
+                    low_word = int(values[1])   # 40033 - младший
+                    distance = self.doubleword_to_float(low_word, high_word)
+                    return distance
+        except Exception as e:
+            print(f" Ошибка чтения расстояния датчика 3 до центра: {e}")
+        return None
+    
     def process_wall_measurement_results(self):
         """Обработка результатов измерения стенки при переходе 10→11"""
         try:
@@ -2249,24 +2829,96 @@ class LaserGeometrySystem:
                 print(" Ошибка: нет данных измерений фланца для обработки")
                 return
             
-            # ДИАГНОСТИКА: Показываем содержимое буферов (первые 5 и последние 5 значений)
+            # ДИАГНОСТИКА: Выводим ВСЕ буферы усредненных значений датчиков
+            print(f"\n{'='*80}")
+            print(f" ДИАГНОСТИКА: ВСЕ БУФЕРЫ УСРЕДНЕННЫХ ЗНАЧЕНИЙ ДАТЧИКОВ")
+            print(f"{'='*80}")
+            
+            print(f"\n [БУФЕР УСРЕДНЕННЫХ ЗНАЧЕНИЙ ДАТЧИКА 1] Размер: {len(self.sensor1_flange_measurements)}")
+            if len(self.sensor1_flange_measurements) > 0:
+                print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.sensor1_flange_measurements]}")
+                # Статистика по датчику 1
+                max_sensor1 = max(self.sensor1_flange_measurements)
+                min_sensor1 = min(self.sensor1_flange_measurements)
+                avg_sensor1 = sum(self.sensor1_flange_measurements) / len(self.sensor1_flange_measurements)
+                print(f"   СТАТИСТИКА: макс={max_sensor1:.3f}мм, сред={avg_sensor1:.3f}мм, мин={min_sensor1:.3f}мм")
+            else:
+                print(f"   БУФЕР ПУСТ!")
+            
+            print(f"\n [БУФЕР УСРЕДНЕННЫХ ЗНАЧЕНИЙ ДАТЧИКА 3] Размер: {len(self.sensor3_measurements)}")
+            if len(self.sensor3_measurements) > 0:
+                print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.sensor3_measurements]}")
+                # Статистика по датчику 3
+                max_sensor3 = max(self.sensor3_measurements)
+                min_sensor3 = min(self.sensor3_measurements)
+                avg_sensor3 = sum(self.sensor3_measurements) / len(self.sensor3_measurements)
+                print(f"   СТАТИСТИКА: макс={max_sensor3:.3f}мм, сред={avg_sensor3:.3f}мм, мин={min_sensor3:.3f}мм")
+            else:
+                print(f"   БУФЕР ПУСТ!")
+            
+            print(f"\n [БУФЕР УСРЕДНЕННЫХ ЗНАЧЕНИЙ ДАТЧИКА 4] Размер: {len(self.sensor4_measurements)}")
+            if len(self.sensor4_measurements) > 0:
+                print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.sensor4_measurements]}")
+                # Статистика по датчику 4
+                max_sensor4 = max(self.sensor4_measurements)
+                min_sensor4 = min(self.sensor4_measurements)
+                avg_sensor4 = sum(self.sensor4_measurements) / len(self.sensor4_measurements)
+                print(f"   СТАТИСТИКА: макс={max_sensor4:.3f}мм, сред={avg_sensor4:.3f}мм, мин={min_sensor4:.3f}мм")
+            else:
+                print(f"   БУФЕР ПУСТ!")
+            
+            # ДИАГНОСТИКА: Выводим ВСЕ буферы рассчитанных значений
+            print(f"\n{'='*80}")
+            print(f" ДИАГНОСТИКА: ВСЕ БУФЕРЫ РАССЧИТАННЫХ ЗНАЧЕНИЙ")
+            print(f"{'='*80}")
+            
             print(f"\n [БУФЕР ДИАМЕТР КОРПУСА] Размер: {len(self.body_diameter_buffer)}")
-            print(f"   Первые 5: {[f'{x:.3f}' for x in list(self.body_diameter_buffer)[:5]]}")
-            print(f"   Последние 5: {[f'{x:.3f}' for x in list(self.body_diameter_buffer)[-5:]]}")
+            if len(self.body_diameter_buffer) > 0:
+                print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.body_diameter_buffer]}")
+            else:
+                print(f"   БУФЕР ПУСТ!")
+            
+            print(f"\n [БУФЕР ДИАМЕТР ФЛАНЦА] Размер: {len(self.flange_diameter_buffer)}")
+            if len(self.flange_diameter_buffer) > 0:
+                print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.flange_diameter_buffer]}")
+            else:
+                print(f"   БУФЕР ПУСТ!")
             
             print(f"\n [БУФЕР ТОЛЩИНА ДНА] Размер: {len(self.bottom_thickness_buffer)}")
-            print(f"   Первые 5: {[f'{x:.3f}' for x in list(self.bottom_thickness_buffer)[:5]]}")
-            print(f"   Последние 5: {[f'{x:.3f}' for x in list(self.bottom_thickness_buffer)[-5:]]}\n")
+            if len(self.bottom_thickness_buffer) > 0:
+                print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.bottom_thickness_buffer]}")
+            else:
+                print(f"   БУФЕР ПУСТ!")
+            
+            print(f"\n [БУФЕР ТОЛЩИНА ФЛАНЦА] Размер: {len(self.flange_thickness_buffer)}")
+            if len(self.flange_thickness_buffer) > 0:
+                print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.flange_thickness_buffer]}")
+            else:
+                print(f"   БУФЕР ПУСТ!")
+            
+            print(f"\n{'='*80}\n")
             
             # Вычисляем статистику для диаметра корпуса
-            max_body_diameter = max(self.body_diameter_buffer)
-            min_body_diameter = min(self.body_diameter_buffer)
-            avg_body_diameter = sum(self.body_diameter_buffer) / len(self.body_diameter_buffer)
+            # Фильтруем некорректные значения (0, отрицательные, NaN, inf) перед вычислением статистики
+            valid_body_diameters = [d for d in self.body_diameter_buffer 
+                                   if d is not None and d > 0 and not (math.isnan(d) or math.isinf(d))]
+            if len(valid_body_diameters) == 0:
+                print(" ОШИБКА: Нет валидных значений диаметра корпуса!")
+                return
+            max_body_diameter = max(valid_body_diameters)
+            min_body_diameter = min(valid_body_diameters)
+            avg_body_diameter = sum(valid_body_diameters) / len(valid_body_diameters)
             
             # Вычисляем статистику для диаметра фланца
-            max_flange_diameter = max(self.flange_diameter_buffer)
-            min_flange_diameter = min(self.flange_diameter_buffer)
-            avg_flange_diameter = sum(self.flange_diameter_buffer) / len(self.flange_diameter_buffer)
+            # Фильтруем некорректные значения (0, отрицательные, NaN, inf) перед вычислением статистики
+            valid_flange_diameters = [d for d in self.flange_diameter_buffer 
+                                     if d is not None and d > 0 and not (math.isnan(d) or math.isinf(d))]
+            if len(valid_flange_diameters) == 0:
+                print(" ОШИБКА: Нет валидных значений диаметра фланца!")
+                return
+            max_flange_diameter = max(valid_flange_diameters)
+            min_flange_diameter = min(valid_flange_diameters)
+            avg_flange_diameter = sum(valid_flange_diameters) / len(valid_flange_diameters)
             
             # Вычисляем статистику для толщины фланца
             max_flange_thickness = max(self.flange_thickness_buffer)
@@ -2310,8 +2962,8 @@ class LaserGeometrySystem:
                 self.write_stream_result_to_input_registers(min_body_diameter, 30050)   # Минимальное
                 
                 # Диаметр фланца → 30052-30057
-                self.write_stream_result_to_input_registers(max_flange_diameter, 30052) # Максимальное
-                self.write_stream_result_to_input_registers(avg_flange_diameter, 30054) # Среднее
+                self.write_stream_result_to_input_registers(max_flange_diameter, 30054) # Максимальное
+                self.write_stream_result_to_input_registers(avg_flange_diameter, 30052) # Среднее
                 self.write_stream_result_to_input_registers(min_flange_diameter, 30056) # Минимальное
                 
                 # Толщина фланца → 30034-30039
@@ -2411,10 +3063,8 @@ class LaserGeometrySystem:
             # Статус уже установлен в manage_measurement_cycle_flag
             # Просто продолжаем сбор данных
             
-            # Выполняем QUAD измерение датчиков 1, 3 и 4 (как в main.py)
-            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-            )
+            # Выполняем QUAD измерение датчиков 1, 3 и 4 (безопасное чтение с блокировкой)
+            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
             
             # Увеличиваем счетчик измерений
             self.frequency_counter += 1
@@ -2428,8 +3078,11 @@ class LaserGeometrySystem:
                     print(f" [CMD=12] Частота опроса: {instant_freq:.1f} Гц | Измерений: {self.frequency_counter}")
                 self.last_frequency_display = current_time
             
-            # Проверяем что получили данные от датчиков 1, 3 и 4
-            if (sensor1_mm is not None and sensor3_mm is not None and sensor4_mm is not None):
+            # Проверяем что получили валидные данные от датчиков 1, 3 и 4
+            # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
+            if (self.is_valid_measurement(sensor1_mm) and 
+                self.is_valid_measurement(sensor3_mm) and 
+                self.is_valid_measurement(sensor4_mm)):
                 # Добавляем в временные буферы для усреднения
                 self.temp_sensor1_flange_buffer.append(sensor1_mm)
                 self.temp_sensor3_buffer.append(sensor3_mm)
@@ -2437,10 +3090,39 @@ class LaserGeometrySystem:
                 
                 # Когда накопилось 10 измерений - усредняем и записываем
                 if len(self.temp_sensor1_flange_buffer) >= 10:
-                    # Вычисляем средние значения
-                    avg_sensor1 = sum(self.temp_sensor1_flange_buffer) / len(self.temp_sensor1_flange_buffer)
-                    avg_sensor3 = sum(self.temp_sensor3_buffer) / len(self.temp_sensor3_buffer)
-                    avg_sensor4 = sum(self.temp_sensor4_buffer) / len(self.temp_sensor4_buffer)
+                    # Фильтруем аномальные значения перед усреднением (используем медианный фильтр)
+                    # Сортируем значения и берем медиану для каждого датчика
+                    sorted_sensor1 = sorted(self.temp_sensor1_flange_buffer)
+                    sorted_sensor3 = sorted(self.temp_sensor3_buffer)
+                    sorted_sensor4 = sorted(self.temp_sensor4_buffer)
+                    
+                    # Вычисляем медиану (среднее из двух центральных значений для четного количества)
+                    median_sensor1 = (sorted_sensor1[4] + sorted_sensor1[5]) / 2.0
+                    median_sensor3 = (sorted_sensor3[4] + sorted_sensor3[5]) / 2.0
+                    median_sensor4 = (sorted_sensor4[4] + sorted_sensor4[5]) / 2.0
+                    
+                    # Фильтруем значения, которые отклоняются от медианы более чем на 1.5мм
+                    # Это поможет отбросить аномальные значения
+                    filtered_sensor1 = [v for v in self.temp_sensor1_flange_buffer if abs(v - median_sensor1) <= 1.5]
+                    filtered_sensor3 = [v for v in self.temp_sensor3_buffer if abs(v - median_sensor3) <= 1.5]
+                    filtered_sensor4 = [v for v in self.temp_sensor4_buffer if abs(v - median_sensor4) <= 1.5]
+                    
+                    # Если после фильтрации осталось менее 5 значений - используем медиану
+                    # Иначе используем среднее отфильтрованных значений
+                    if len(filtered_sensor1) >= 5:
+                        avg_sensor1 = sum(filtered_sensor1) / len(filtered_sensor1)
+                    else:
+                        avg_sensor1 = median_sensor1
+                    
+                    if len(filtered_sensor3) >= 5:
+                        avg_sensor3 = sum(filtered_sensor3) / len(filtered_sensor3)
+                    else:
+                        avg_sensor3 = median_sensor3
+                    
+                    if len(filtered_sensor4) >= 5:
+                        avg_sensor4 = sum(filtered_sensor4) / len(filtered_sensor4)
+                    else:
+                        avg_sensor4 = median_sensor4
                     
                     # Добавляем усредненные значения в основные буферы
                     self.sensor1_flange_measurements.append(avg_sensor1)
@@ -2449,18 +3131,21 @@ class LaserGeometrySystem:
                     
                     # Используем кешированные калиброванные значения
                     distance_to_center = self.cached_distance_to_center
+                    distance_to_center_flange = self.cached_distance_sensor3_to_center  # Расстояние датчика 3 до центра (из команды 105)
                     distance_1_3 = self.cached_distance_1_3
                     distance_sensor4 = self.cached_distance_sensor4
                     
-                    if (distance_to_center is not None and distance_1_3 is not None and 
-                        distance_sensor4 is not None):
+                    if (distance_to_center is not None and distance_to_center_flange is not None and 
+                        distance_1_3 is not None and distance_sensor4 is not None):
                         
                         # 1) Диаметр корпуса (Датчик 1)
+                        # Формула: (расстояние до центра - показание датчика 1) * 2
                         body_diameter = distance_to_center - avg_sensor1
                         self.body_diameter_buffer.append(body_diameter)
                         
                         # 2) Диаметр фланца (Датчик 3)
-                        flange_diameter = distance_to_center + distance_1_3 - avg_sensor3
+                        # Формула: (расстояние датчика 3 до центра - показание датчика 3) * 2
+                        flange_diameter = distance_to_center_flange - avg_sensor3
                         self.flange_diameter_buffer.append(flange_diameter)
                         
                         # 3) Толщина фланца (Датчики 1,3)
@@ -2502,18 +3187,19 @@ class LaserGeometrySystem:
         
         try:
             # Инициализация таймера частоты при первом измерении дна
-            if self.frequency_start_time is None:
+            # Важно: всегда сбрасываем счетчики при входе в состояние измерения нижней стенки
+            # чтобы не использовать данные от предыдущего измерения верхней стенки
+            if not hasattr(self, '_bottom_frequency_initialized') or self.frequency_start_time is None:
                 self.frequency_start_time = time.time()
                 self.last_frequency_display = self.frequency_start_time
                 self.frequency_counter = 0
+                self._bottom_frequency_initialized = True
             
             # Статус уже установлен в manage_measurement_cycle_flag
             # Просто продолжаем сбор данных
             
-            # Выполняем QUAD измерение датчиков 1 и 2 (как в main.py)
-            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-            )
+            # Выполняем QUAD измерение датчиков 1 и 2 (безопасное чтение с блокировкой)
+            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
             
             # Увеличиваем счетчик измерений
             self.frequency_counter += 1
@@ -2527,17 +3213,37 @@ class LaserGeometrySystem:
                     print(f" [CMD=14] Частота опроса: {instant_freq:.1f} Гц | Измерений: {self.frequency_counter}")
                 self.last_frequency_display = current_time
             
-            # Проверяем что получили данные от датчиков 1 и 2
-            if sensor1_mm is not None and sensor2_mm is not None:
+            # Проверяем что получили валидные данные от датчиков 1 и 2
+            # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
+            if (self.is_valid_measurement(sensor1_mm) and self.is_valid_measurement(sensor2_mm)):
                 # Добавляем в временные буферы для усреднения
                 self.temp_sensor1_bottom_buffer.append(sensor1_mm)
                 self.temp_sensor2_bottom_buffer.append(sensor2_mm)
                 
                 # Когда накопилось 10 измерений - усредняем и записываем
                 if len(self.temp_sensor1_bottom_buffer) >= 10:
-                    # Вычисляем средние значения
-                    avg_sensor1 = sum(self.temp_sensor1_bottom_buffer) / len(self.temp_sensor1_bottom_buffer)
-                    avg_sensor2 = sum(self.temp_sensor2_bottom_buffer) / len(self.temp_sensor2_bottom_buffer)
+                    # Фильтруем аномальные значения перед усреднением (используем медианный фильтр)
+                    sorted_sensor1 = sorted(self.temp_sensor1_bottom_buffer)
+                    sorted_sensor2 = sorted(self.temp_sensor2_bottom_buffer)
+                    
+                    # Вычисляем медиану
+                    median_sensor1 = (sorted_sensor1[4] + sorted_sensor1[5]) / 2.0
+                    median_sensor2 = (sorted_sensor2[4] + sorted_sensor2[5]) / 2.0
+                    
+                    # Фильтруем значения, которые отклоняются от медианы более чем на 1.5мм
+                    filtered_sensor1 = [v for v in self.temp_sensor1_bottom_buffer if abs(v - median_sensor1) <= 1.5]
+                    filtered_sensor2 = [v for v in self.temp_sensor2_bottom_buffer if abs(v - median_sensor2) <= 1.5]
+                    
+                    # Если после фильтрации осталось менее 5 значений - используем медиану
+                    if len(filtered_sensor1) >= 5:
+                        avg_sensor1 = sum(filtered_sensor1) / len(filtered_sensor1)
+                    else:
+                        avg_sensor1 = median_sensor1
+                    
+                    if len(filtered_sensor2) >= 5:
+                        avg_sensor2 = sum(filtered_sensor2) / len(filtered_sensor2)
+                    else:
+                        avg_sensor2 = median_sensor2
                     
                     # Добавляем усредненные значения в основные буферы
                     self.sensor1_bottom_measurements.append(avg_sensor1)
@@ -2613,8 +3319,9 @@ class LaserGeometrySystem:
             # Пока датчик = 0 → ищем препятствие
             # Как только датчик != 0 (5 раз подряд) → нашли препятствие, считаем высоту
             
-            if sensor1_mm is not None and sensor1_mm > 0.0:
-                # Датчик показывает ненулевое значение - есть препятствие!
+            # Проверяем валидность измерения (фильтруем None, 0, отрицательные, вне диапазона)
+            if self.is_valid_measurement(sensor1_mm):
+                # Датчик показывает валидное ненулевое значение - есть препятствие!
                 self.obstacle_filter_count += 1
                 
                 if not self.obstacle_detected and self.obstacle_filter_count >= 5:
@@ -2774,6 +3481,13 @@ class LaserGeometrySystem:
         CMD=10: Сбор данных измерения верхней стенки
         Просто собираем данные, не делаем подсчёт
         """
+        # Очищаем буферы перед началом измерений (один раз при входе в состояние)
+        if not hasattr(self, '_wall_measurement_started'):
+            self._wall_measurement_started = True
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
+            print(f" [CMD=10] Буферы очищены перед началом измерений")
+        
         # Загружаем калиброванное расстояние в кеш (один раз при входе в состояние)
         if self.cached_distance_1_2 is None:
             self.cached_distance_1_2 = self.read_calibrated_distance_1_2()
@@ -2810,13 +3524,22 @@ class LaserGeometrySystem:
         CMD=12: Сбор данных измерения фланца
         Просто собираем данные, не делаем подсчёт
         """
+        # Очищаем буферы перед началом измерений (один раз при входе в состояние)
+        if not hasattr(self, '_flange_measurement_started'):
+            self._flange_measurement_started = True
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
+            print(f" [CMD=12] Буферы очищены перед началом измерений")
+        
         # Загружаем калиброванные расстояния в кеш (один раз при входе в состояние)
         if self.cached_distance_to_center is None:
             self.cached_distance_to_center = self.read_calibrated_distance_to_center()
             self.cached_distance_1_3 = self.read_calibrated_distance_1_3()
             self.cached_distance_sensor4 = self.read_calibrated_distance_sensor4()
+            self.cached_distance_sensor3_to_center = self.read_calibrated_distance_sensor3_to_center()
             print(f" Загружены расстояния: центр={self.cached_distance_to_center:.3f}мм, "
-                  f"1-3={self.cached_distance_1_3:.3f}мм, sensor4={self.cached_distance_sensor4:.3f}мм")
+                  f"1-3={self.cached_distance_1_3:.3f}мм, sensor4={self.cached_distance_sensor4:.3f}мм, "
+                  f"sensor3_to_center={self.cached_distance_sensor3_to_center:.3f}мм")
         
         # Перенаправляем на существующий метод
         self.handle_measure_flange_state()
@@ -2849,6 +3572,20 @@ class LaserGeometrySystem:
         CMD=14: Сбор данных измерения нижней стенки
         Просто собираем данные, не делаем подсчёт
         """
+        # Очищаем буферы перед началом измерений (один раз при входе в состояние)
+        if not hasattr(self, '_bottom_measurement_started'):
+            self._bottom_measurement_started = True
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
+            # Сбрасываем счетчики частоты для нового измерения (важно!)
+            self.frequency_counter = 0
+            self.frequency_start_time = None
+            self.last_frequency_display = 0
+            # Сбрасываем флаг инициализации частоты для нижней стенки
+            if hasattr(self, '_bottom_frequency_initialized'):
+                delattr(self, '_bottom_frequency_initialized')
+            print(f" [CMD=14] Буферы очищены перед началом измерений, счетчики частоты сброшены")
+        
         # Загружаем калиброванное расстояние в кеш (один раз при входе в состояние)
         # Используем тот же кеш что и для CMD=10, т.к. это то же расстояние 1-2
         if self.cached_distance_1_2 is None:
@@ -2912,6 +3649,11 @@ class LaserGeometrySystem:
                 
                 # Отмечаем что оценка выполнена
                 self.quality_evaluated = True
+                
+                # Очищаем буферы после расчетов команды 16
+                self.clear_measurement_buffers()
+                self.clear_serial_buffers()
+                print(f" [CMD=16] Буферы очищены после оценки качества")
             
         except Exception as e:
             print(f" Ошибка оценки качества: {e}")
@@ -3065,12 +3807,14 @@ class LaserGeometrySystem:
                 low_word, high_word = self.float_to_doubleword(value)
                 
                 # Вычисляем индексы регистров
-                reg_index_high = base_address - 30000      # Старший регистр
-                reg_index_low = base_address - 30000 + 1   # Младший регистр
+                # По описанию: base_address - 1 содержит младшее слово, base_address содержит старшее слово
+                # Например, для 30052: индекс 51 = младшее слово, индекс 52 = старшее слово
+                reg_index_low = base_address - 30000 - 1   # Младший регистр (base_address - 1)
+                reg_index_high = base_address - 30000      # Старший регистр (base_address)
                 
                 # Записываем в Input регистры (функция 4)
-                self.modbus_server.slave_context.setValues(4, reg_index_high, [int(high_word)])  # Старший
                 self.modbus_server.slave_context.setValues(4, reg_index_low, [int(low_word)])    # Младший
+                self.modbus_server.slave_context.setValues(4, reg_index_high, [int(high_word)])  # Старший
                 
         except Exception as e:
             print(f" ОШИБКА ЗАПИСИ В INPUT РЕГИСТРЫ {base_address}-{base_address+1}: {e}")
