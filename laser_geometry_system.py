@@ -10,6 +10,7 @@ import struct
 import os
 import ctypes
 import math
+import contextlib
 from queue import Queue, Empty
 from enum import Enum
 from typing import Optional, Tuple, List
@@ -397,13 +398,13 @@ class LaserGeometrySystem:
                 self.db_integration.stop_monitoring()
             except Exception as e:
                 print(f"Ошибка остановки мониторинга БД: {e}")
-        
+            
         if self.modbus_server:
             try:
                 self.modbus_server.stop_modbus_server()
             except Exception as e:
                 print(f"Ошибка остановки Modbus сервера: {e}")
-        
+            
         # Очищаем системные оптимизации
         cleanup_laser_system_optimizations()
             
@@ -521,17 +522,8 @@ class LaserGeometrySystem:
                 except Empty:
                     attempts += 1
 
-        # Фолбэк к прямому чтению
-        try:
-            with self.sensor_reading_lock:
-                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                    self.sensor_range_mm, self.sensor_range_mm,
-                    self.sensor_range_mm, self.sensor_range_mm
-                )
-                return sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm
-        except Exception as e:
-            print(f" [READ SENSORS] Ошибка чтения датчиков: {e}")
-            return None, None, None, None
+        # Данных в очереди нет — возвращаем None, чтобы вызывающий код повторил попытку
+        return None, None, None, None
     
     def main_loop(self):
         """Основной цикл системы"""
@@ -1486,10 +1478,17 @@ class LaserGeometrySystem:
         """Очистка буферов серийного порта ОС Windows"""
         try:
             if self.sensors and self.sensors.ser:
-                if hasattr(self.sensors.ser, 'reset_input_buffer'):
-                    self.sensors.ser.reset_input_buffer()
-                if hasattr(self.sensors.ser, 'reset_output_buffer'):
-                    self.sensors.ser.reset_output_buffer()
+                lock = getattr(self, 'sensor_reading_lock', None)
+                if lock:
+                    lock_context = lock
+                else:
+                    lock_context = contextlib.nullcontext()
+
+                with lock_context:
+                    if hasattr(self.sensors.ser, 'reset_input_buffer'):
+                        self.sensors.ser.reset_input_buffer()
+                    if hasattr(self.sensors.ser, 'reset_output_buffer'):
+                        self.sensors.ser.reset_output_buffer()
         except Exception as e:
             # Игнорируем ошибки очистки буферов
             pass
@@ -1708,9 +1707,10 @@ class LaserGeometrySystem:
                 self.last_frequency_display = self.frequency_start_time
             
             # Читаем только датчик 1
-            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-            )
+            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+            if sensor1_mm is None:
+                time.sleep(0.001)
+                return
             
             # Отладочная информация о сырых показаниях (только первые несколько измерений)
             if self.frequency_counter <= 5:
@@ -1882,9 +1882,10 @@ class LaserGeometrySystem:
                 self.write_cycle_flag(105)
                 
                 # Выполняем QUAD измерение (но используем только датчик 3)
-                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                    self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-                )
+                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+                if sensor3_mm is None:
+                    time.sleep(0.001)
+                    return
                 
                 # Сохраняем только измерения датчика 3
                 # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
@@ -2360,10 +2361,11 @@ class LaserGeometrySystem:
             
             if elapsed < self.calibrate_flange_measurement_duration:
                 # Выполняем QUAD измерение (но используем только датчик 1)
-                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                    self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-                )
-                
+                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+                if sensor1_mm is None:
+                    time.sleep(0.001)
+                    return
+
                 # Сохраняем только измерения датчика 1
                 # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
                 if self.is_valid_measurement(sensor1_mm):
@@ -2493,10 +2495,11 @@ class LaserGeometrySystem:
         
         while (time.time() - start_time) < self.measurement_duration:
             try:
-                # Выполняем QUAD измерение (как в main.py - с параметрами диапазонов)
-                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                    self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-                )
+                # Выполняем чтение измерений с защитой от конфликтов
+                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+                if sensor1_mm is None or sensor2_mm is None or sensor3_mm is None:
+                    time.sleep(0.001)
+                    continue
                 
                 # Сохраняем только валидные измерения для калибровки стенки
                 # Для калибровки стенки нужны только датчики 1, 2 и 3 (датчик 4 не используется)
@@ -2630,11 +2633,12 @@ class LaserGeometrySystem:
         
         while (time.time() - start_time) < self.measurement_duration:
             try:
-                # Выполняем QUAD измерение (как в команде 100)
-                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                    self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-                )
-                
+                # Выполняем чтение измерений с защитой от конфликтов
+                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+                if sensor4_mm is None:
+                    time.sleep(0.001)
+                    continue
+
                 # Сохраняем только измерения датчика 4
                 # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
                 if self.is_valid_measurement(sensor4_mm):
@@ -2720,11 +2724,12 @@ class LaserGeometrySystem:
         
         while (time.time() - start_time) < self.measurement_duration:
             try:
-                # Выполняем QUAD измерение (как в команде 100)
-                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                    self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-                )
-                
+                # Выполняем чтение измерений с защитой от конфликтов
+                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+                if sensor1_mm is None:
+                    time.sleep(0.001)
+                    continue
+
                 # Сохраняем только измерения датчика 1
                 # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
                 if self.is_valid_measurement(sensor1_mm):
@@ -2813,6 +2818,9 @@ class LaserGeometrySystem:
             
             # Выполняем QUAD измерение датчиков 1 и 2 (безопасное чтение с блокировкой)
             sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+            if sensor1_mm is None or sensor2_mm is None:
+                time.sleep(0.001)
+                return
             
             # Увеличиваем счетчик измерений
             self.frequency_counter += 1
@@ -3248,6 +3256,9 @@ class LaserGeometrySystem:
             
             # Выполняем QUAD измерение датчиков 1, 3 и 4 (безопасное чтение с блокировкой)
             sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+            if sensor1_mm is None or sensor3_mm is None or sensor4_mm is None:
+                time.sleep(0.001)
+                return
             
             # Увеличиваем счетчик измерений
             self.frequency_counter += 1
@@ -3383,6 +3394,9 @@ class LaserGeometrySystem:
             
             # Выполняем QUAD измерение датчиков 1 и 2 (безопасное чтение с блокировкой)
             sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+            if sensor1_mm is None or sensor2_mm is None:
+                time.sleep(0.001)
+                return
             
             # Увеличиваем счетчик измерений
             self.frequency_counter += 1
@@ -3481,9 +3495,10 @@ class LaserGeometrySystem:
                 print(" [CMD=9] Начало поиска препятствия...")
             
             # Читаем только датчик 1 для поиска препятствия
-            sensor1_mm, _, _, _ = self.sensors.perform_quad_sensor_measurement(
-                self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-            )
+            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+            if sensor1_mm is None:
+                time.sleep(0.001)
+                return
             
             # Увеличиваем счетчик измерений
             self.frequency_counter += 1
@@ -3874,10 +3889,12 @@ class LaserGeometrySystem:
                 self.stream_temp_sensor4_buffer = []
                 print(" Запущен QUAD потоковый режим (все 4 датчика)")
             
-            # Выполняем QUAD измерение (все 4 датчика одновременно)
-            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm, self.sensor_range_mm
-            )
+            # Забираем очередное измерение из потока чтения датчиков
+            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+            if None in (sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm):
+                # Данные ещё не готовы – делаем короткую паузу и повторяем цикл
+                time.sleep(0.001)
+                return
             
             self.stream_measurement_count += 1
             
@@ -4033,7 +4050,7 @@ def main():
     finally:
         try:
             system.stop_system()
-        except:
+        except Exception:
             pass
         # Финальная очистка оптимизаций
         cleanup_laser_system_optimizations()
