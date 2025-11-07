@@ -1387,7 +1387,7 @@ class LaserGeometrySystem:
             # При записи: base_address - 1 = младшее слово, base_address = старшее слово
             # При чтении: reg_pair[0] = base_address = старшее слово, reg_pair[0] - 1 = младшее слово
             first_idx = reg_pair[0] - base_offset      # Старшее слово (base_address)
-            second_idx = reg_pair[0] - base_offset - 1  # Младшее слово (base_address - 1)
+            second_idx = reg_pair[0] - base_offset + 1  # Младшее слово (base_address)
             
             # Читаем значения (В HMI: base_address = старшее слово, base_address - 1 = младшее слово)
             high_word = self.modbus_server.slave_context.getValues(function_code, first_idx, 1)[0]
@@ -3809,12 +3809,12 @@ class LaserGeometrySystem:
                 # Вычисляем индексы регистров
                 # По описанию: base_address - 1 содержит младшее слово, base_address содержит старшее слово
                 # Например, для 30052: индекс 51 = младшее слово, индекс 52 = старшее слово
-                reg_index_low = base_address - 30000 - 1   # Младший регистр (base_address - 1)
-                reg_index_high = base_address - 30000      # Старший регистр (base_address)
+                reg_index_low = base_address - 30000    # Младший регистр (base_address - 1)
+                reg_index_high = base_address - 30000 + 1      # Старший регистр (base_address)
                 
                 # Записываем в Input регистры (функция 4)
-                self.modbus_server.slave_context.setValues(4, reg_index_low, [int(low_word)])    # Младший
-                self.modbus_server.slave_context.setValues(4, reg_index_high, [int(high_word)])  # Старший
+                self.modbus_server.slave_context.setValues(4, reg_index_low, [int(high_word)])    # Младший
+                self.modbus_server.slave_context.setValues(4, reg_index_high, [int(low_word)])  # Старш
                 
         except Exception as e:
             print(f" ОШИБКА ЗАПИСИ В INPUT РЕГИСТРЫ {base_address}-{base_address+1}: {e}")
