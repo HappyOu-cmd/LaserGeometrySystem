@@ -205,9 +205,14 @@ class HighSpeedRiftekSensor:
                     xonxoff=False
                 )
             
-            # Агрессивная настройка буферов для максимальной скорости
-            self.ser.reset_input_buffer()
-            self.ser.reset_output_buffer()
+            # Очищаем буферы только при первичном подключении, чтобы убрать старые данные.
+            try:
+                if hasattr(self.ser, 'reset_input_buffer'):
+                    self.ser.reset_input_buffer()
+                if hasattr(self.ser, 'reset_output_buffer'):
+                    self.ser.reset_output_buffer()
+            except Exception as e:
+                print(f"WARNING: Не удалось очистить буферы последовательного порта: {e}")
             
             # Попытка установить размеры буферов для лучшей производительности
             try:

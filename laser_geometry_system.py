@@ -25,7 +25,6 @@ except ImportError:
 # Импорты из существующих модулей
 from main import HighSpeedRiftekSensor, apply_system_optimizations
 from modbus_slave_server import ModbusSlaveServer
-from modbus_debug_gui import ModbusDebugGUI
 from modbus_database_integration import ModbusDatabaseIntegration
 
 
@@ -135,7 +134,7 @@ class LaserGeometrySystem:
     """Основная система лазерной геометрии"""
     
     def __init__(self, port: str = 'COM11', baudrate: int = 921600, modbus_port: int = 502, 
-                 test_mode: bool = False, enable_debug_gui: bool = False):
+                 test_mode: bool = False):
         """
         Инициализация системы
         
@@ -144,18 +143,15 @@ class LaserGeometrySystem:
             baudrate: Скорость передачи данных
             modbus_port: Порт Modbus сервера
             test_mode: Режим тестирования без реальных датчиков
-            enable_debug_gui: Включить GUI для отладки Modbus
         """
         # Настройки датчиков
         self.port = port
         self.baudrate = baudrate
         self.test_mode = test_mode
-        self.enable_debug_gui = enable_debug_gui
         
         # Компоненты системы
         self.sensors = None
         self.modbus_server = None
-        self.debug_gui = None
         self.db_integration = None
         
         # Состояние системы
@@ -346,20 +342,12 @@ class LaserGeometrySystem:
         self.db_integration.start_monitoring(interval=1.0)
         print("OK Интеграция с базой данных запущена")
         
-        # Инициализация Debug GUI (если включен)
-        if self.enable_debug_gui:
-            # Передаем Modbus сервер с уже настроенной интеграцией БД
-            self.modbus_server.db_integration = self.db_integration
-            self.debug_gui = ModbusDebugGUI(self.modbus_server)
-            print("OK Debug GUI инициализирован с интеграцией БД")
-        
-        # Запуск потока чтения датчиков ОТКЛЮЧЕН - используем прямое чтение с блокировкой
-        # Поток чтения датчиков можно включить позже, когда функции измерения будут использовать очередь
-        # if self.sensors and not self.test_mode:
-        #     self.sensor_reading_active = True
-        #     self.sensor_reading_thread = threading.Thread(target=self.sensor_reading_loop, daemon=True)
-        #     self.sensor_reading_thread.start()
-        #     print("OK Поток чтения датчиков запущен (высокий приоритет)")
+        # Запуск потока чтения датчиков для доставки данных через очередь
+        if self.sensors and not self.test_mode and not self.sensor_reading_active:
+            self.sensor_reading_active = True
+            self.sensor_reading_thread = threading.Thread(target=self.sensor_reading_loop, daemon=True)
+            self.sensor_reading_thread.start()
+            print("OK Поток чтения датчиков запущен")
         
         # Запуск основного цикла в отдельном потоке
         self.is_running = True
@@ -367,13 +355,8 @@ class LaserGeometrySystem:
         main_thread.start()
         print("OK Основной цикл запущен")
         
-        # Запуск Debug GUI в главном потоке (если включен)
-        if self.enable_debug_gui and self.debug_gui:
-            print("OK Debug GUI запущен")
-            self.debug_gui.start()  # Блокирующий вызов в главном потоке
-        else:
-            # Если GUI не нужен, просто ждем завершения основного потока
-            main_thread.join()
+        # Ждем завершения основного потока
+        main_thread.join()
         
         return True
     
@@ -414,15 +397,12 @@ class LaserGeometrySystem:
                 self.db_integration.stop_monitoring()
             except Exception as e:
                 print(f"Ошибка остановки мониторинга БД: {e}")
-            
+        
         if self.modbus_server:
             try:
                 self.modbus_server.stop_modbus_server()
             except Exception as e:
                 print(f"Ошибка остановки Modbus сервера: {e}")
-            
-        if self.debug_gui:
-            self.debug_gui.close_gui()
         
         # Очищаем системные оптимизации
         cleanup_laser_system_optimizations()
@@ -525,21 +505,29 @@ class LaserGeometrySystem:
         """
         if not self.sensors:
             return None, None, None, None
-        
+
+        # Если работает поток чтения, пробуем взять свежие данные из очереди
+        if self.sensor_reading_active and self.sensor_reading_thread and self.sensor_reading_thread.is_alive():
+            attempts = 0
+            while attempts < 5:
+                try:
+                    data = self.sensor_data_queue.get(timeout=0.01)
+                    return (
+                        data.get('sensor1'),
+                        data.get('sensor2'),
+                        data.get('sensor3'),
+                        data.get('sensor4'),
+                    )
+                except Empty:
+                    attempts += 1
+
+        # Фолбэк к прямому чтению
         try:
             with self.sensor_reading_lock:
-                # Очищаем буферы серийного порта перед каждым чтением для предотвращения накопления старых данных
-                try:
-                    if hasattr(self.sensors.ser, 'reset_input_buffer'):
-                        self.sensors.ser.reset_input_buffer()
-                except:
-                    pass  # Игнорируем ошибки очистки
-                
                 sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.sensors.perform_quad_sensor_measurement(
-                    self.sensor_range_mm, self.sensor_range_mm, 
+                    self.sensor_range_mm, self.sensor_range_mm,
                     self.sensor_range_mm, self.sensor_range_mm
                 )
-                # Убрана пауза - она может вызывать проблемы с синхронизацией
                 return sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm
         except Exception as e:
             print(f" [READ SENSORS] Ошибка чтения датчиков: {e}")
@@ -4031,11 +4019,10 @@ def main():
     PORT = 'COM11'  # Попробуйте другой порт если COM7 занят
     BAUDRATE = 921600
     MODBUS_PORT = 502
-    ENABLE_DEBUG_GUI = True  # Включить GUI для отладки Modbus
     TEST_MODE = False  # Режим с реальными датчиками
     
     # Создание и запуск системы
-    system = LaserGeometrySystem(PORT, BAUDRATE, MODBUS_PORT, test_mode=TEST_MODE, enable_debug_gui=ENABLE_DEBUG_GUI)
+    system = LaserGeometrySystem(PORT, BAUDRATE, MODBUS_PORT, test_mode=TEST_MODE)
     
     try:
         system.start_system()
