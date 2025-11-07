@@ -1493,6 +1493,16 @@ class LaserGeometrySystem:
             # Игнорируем ошибки очистки буферов
             pass
     
+    def flush_sensor_queue(self):
+        """Полностью очищает очередь измерений сенсоров"""
+        if not hasattr(self, 'sensor_data_queue') or self.sensor_data_queue is None:
+            return
+        try:
+            while True:
+                self.sensor_data_queue.get_nowait()
+        except Empty:
+            pass
+
     def finalize_calibration_failure(
         self,
         cmd_code: int,
@@ -1622,6 +1632,7 @@ class LaserGeometrySystem:
         self.stream_temp_sensor4_buffer = []
         
         print(" Буферы измерений очищены")
+        self.flush_sensor_queue()
     
     def stop_all_streams(self):
         """Остановка всех активных потоковых режимов"""
@@ -1845,6 +1856,8 @@ class LaserGeometrySystem:
                 
                 # Очищаем буферы серийного порта перед началом измерений
                 self.clear_serial_buffers()
+                self.flush_sensor_queue()
+                self.flush_sensor_queue()
                 
                 # Очищаем буфер датчика 3
                 self.measurement_buffer['sensor3'].clear()
@@ -2194,6 +2207,7 @@ class LaserGeometrySystem:
                 self.calibrate_bottom_measurement_count = 0
 
                 self.clear_serial_buffers()
+                self.flush_sensor_queue()
                 self.measurement_buffer['sensor4'].clear()
 
                 reference_bottom_thickness = self.read_reference_bottom_thickness()
@@ -2481,6 +2495,7 @@ class LaserGeometrySystem:
         
         # Очищаем буферы серийного порта перед началом измерений
         self.clear_serial_buffers()
+        self.flush_sensor_queue()
         
         # Очищаем буферы перед началом измерений
         self.measurement_buffer['sensor1'].clear()
@@ -2627,6 +2642,7 @@ class LaserGeometrySystem:
         
         # Очищаем буферы серийного порта перед началом измерений
         self.clear_serial_buffers()
+        self.flush_sensor_queue()
         
         # Очищаем буфер датчика 4
         self.measurement_buffer['sensor4'].clear()
@@ -2718,6 +2734,7 @@ class LaserGeometrySystem:
         
         # Очищаем буферы серийного порта перед началом измерений
         self.clear_serial_buffers()
+        self.flush_sensor_queue()
         
         # Очищаем буфер датчика 1
         self.measurement_buffer['sensor1'].clear()
@@ -3880,6 +3897,7 @@ class LaserGeometrySystem:
             if not self.stream_active_quad:
                 # Очищаем буферы серийного порта перед началом QUAD режима
                 self.clear_serial_buffers()
+                self.flush_sensor_queue()
                 self.stream_active_quad = True
                 self.stream_measurement_count = 0
                 self.stream_start_time = time.time()
