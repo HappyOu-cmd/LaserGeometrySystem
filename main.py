@@ -81,7 +81,7 @@ def detect_ftdi_devices():
 class HighSpeedRiftekSensor:
     """Высокоскоростной класс для работы с лазерными датчиками RIFTEK по протоколу RS485"""
     
-    def __init__(self, port: str = 'COM7', baudrate: int = 921600, timeout: float = 1.0):
+    def __init__(self, port: str = '/dev/ttyUSB0', baudrate: int = 921600, timeout: float = 1.0):
         """
         Инициализация соединения с датчиками для ЭКСТРЕМАЛЬНО высокоскоростной работы
         
@@ -174,7 +174,7 @@ class HighSpeedRiftekSensor:
                     # Переключаемся на fallback
                     import serial
                     self.ser = serial.Serial(
-                        port=self.port.replace('ftdi://ftdi:232h/1', 'COM7'),  # Возврат к COM порту
+                        port=self.port.replace('ftdi://ftdi:232h/1', '/dev/ttyUSB0'),  # Возврат к COM порту
                         baudrate=self.baudrate,
                         bytesize=serial.EIGHTBITS,
                         parity=serial.PARITY_EVEN,
@@ -319,6 +319,45 @@ class HighSpeedRiftekSensor:
             if self.error_count <= 10:  # Выводим только первые 10 ошибок
                 print(f"ОШИБКА BROADCAST: {e}")
             self.time_broadcast = time.perf_counter() - start_time
+
+    def _read_exact(self, size: int, overall_timeout: Optional[float] = None) -> bytes:
+        """
+        Дочитывает данные до нужного количества байтов или возвращает то, что удалось получить.
+        Используем общий таймаут, чтобы компенсировать задержку на линии RS485.
+        """
+        if overall_timeout is None:
+            overall_timeout = max((self.timeout or 0.0) * 2, 0.005)
+
+        deadline = time.perf_counter() + overall_timeout
+        buffer = bytearray()
+
+        while len(buffer) < size:
+            remaining = size - len(buffer)
+            chunk = self.ser.read(remaining)
+            if chunk:
+                buffer.extend(chunk)
+                if len(buffer) >= size:
+                    break
+            else:
+                if time.perf_counter() >= deadline:
+                    break
+                time.sleep(0.0001)
+
+        return bytes(buffer)
+
+    def _resync_on_error(self) -> None:
+        """
+        Сбрасываем входной буфер при ошибках, чтобы не "сдвигать" следующий пакет.
+        """
+        try:
+            if hasattr(self.ser, 'reset_input_buffer'):
+                self.ser.reset_input_buffer()
+            elif hasattr(self.ser, 'in_waiting'):
+                to_flush = self.ser.in_waiting or 0
+                if to_flush:
+                    self.ser.read(to_flush)
+        except Exception:
+            pass
     
     def request_measurement_fast(self, sensor_address: int) -> Optional[int]:
         """
@@ -333,6 +372,12 @@ class HighSpeedRiftekSensor:
         start_time = time.perf_counter()
         
         try:
+            # Перед чтением нового ответа убедимся, что в буфере нет "хвостов"
+            if hasattr(self.ser, 'in_waiting'):
+                waiting_bytes = self.ser.in_waiting or 0
+                if waiting_bytes > 0:
+                    self.ser.read(waiting_bytes)
+
             # Используем предварительно сформированные команды для скорости
             if sensor_address == 1:
                 command = self.sensor1_command
@@ -349,7 +394,7 @@ class HighSpeedRiftekSensor:
             self.ser.write(command)
             
             # Чтение ответа (4 байта - результат по тетрадам)
-            response = self.ser.read(4)
+            response = self._read_exact(4)
             
             # Диагностика ошибок (только для первых 10 ошибок)
             if len(response) != 4:
@@ -366,6 +411,7 @@ class HighSpeedRiftekSensor:
                     self.time_sensor3 = time.perf_counter() - start_time
                 elif sensor_address == 4:
                     self.time_sensor4 = time.perf_counter() - start_time
+                self._resync_on_error()
                 return None
             
             # Проверка формата (все байты должны иметь бит 7 = 1)
@@ -383,6 +429,7 @@ class HighSpeedRiftekSensor:
                     self.time_sensor3 = time.perf_counter() - start_time
                 elif sensor_address == 4:
                     self.time_sensor4 = time.perf_counter() - start_time
+                self._resync_on_error()
                 return None
             
             # Оптимизированная сборка результата
@@ -414,6 +461,7 @@ class HighSpeedRiftekSensor:
                 self.time_sensor3 = time.perf_counter() - start_time
             elif sensor_address == 4:
                 self.time_sensor4 = time.perf_counter() - start_time
+            self._resync_on_error()
             return None
     
     def convert_to_mm(self, raw_value: int, sensor_range_mm: float, base_distance_mm: float = 20.0) -> float:
@@ -809,7 +857,8 @@ def main():
             print("Запуск графического интерфейса...")
             import subprocess
             import sys
-            subprocess.run([sys.executable, "gui_sensors.py"])
+            gui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_sensors.py")
+            subprocess.run([sys.executable, gui_path])
             return
         except Exception as e:
             print(f"Ошибка запуска графического режима: {e}")
@@ -821,7 +870,8 @@ def main():
             print("Запуск компактного графического интерфейса...")
             import subprocess
             import sys
-            subprocess.run([sys.executable, "gui_sensors_compact.py"])
+            compact_gui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_sensors_compact.py")
+            subprocess.run([sys.executable, compact_gui_path])
             return
         except Exception as e:
             print(f"Ошибка запуска компактного режима: {e}")
@@ -833,7 +883,8 @@ def main():
             print("Запуск оптимизированного простого интерфейса...")
             import subprocess
             import sys
-            subprocess.run([sys.executable, "gui_sensors_simple_optimized.py"])
+            simple_gui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_sensors_simple_optimized.py")
+            subprocess.run([sys.executable, simple_gui_path])
             return
         except Exception as e:
             print(f"Ошибка запуска простого режима: {e}")
@@ -844,7 +895,7 @@ def main():
         return
     
     # Настройки для ЭКСТРЕМАЛЬНОЙ скорости
-    PORT = 'COM7'           # Ваш COM порт (для pyftdi используйте 'ftdi://ftdi:232h/1')
+    PORT = '/dev/ttyUSB0'   # Укажите нужный ttyUSB/ttyACM порт (для pyftdi используйте 'ftdi://ftdi:232h/1')
     BAUDRATE = 921600       # МАКСИМАЛЬНАЯ скорость RS485
     TIMEOUT = 0.002         # АГРЕССИВНЫЙ таймаут 2 мс для максимальной скорости
 

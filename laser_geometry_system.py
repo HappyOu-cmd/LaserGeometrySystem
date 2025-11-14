@@ -24,7 +24,15 @@ except ImportError:
     HAS_PSUTIL = False
 
 # Импорты из существующих модулей
-from main import HighSpeedRiftekSensor, apply_system_optimizations
+import sys
+
+try:
+    from main import HighSpeedRiftekSensor, apply_system_optimizations
+except ImportError:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    from main import HighSpeedRiftekSensor, apply_system_optimizations
 from modbus_slave_server import ModbusSlaveServer
 from modbus_database_integration import ModbusDatabaseIntegration
 
@@ -134,7 +142,7 @@ class SystemState(Enum):
 class LaserGeometrySystem:
     """Основная система лазерной геометрии"""
     
-    def __init__(self, port: str = 'COM11', baudrate: int = 921600, modbus_port: int = 502, 
+    def __init__(self, port: str = '/dev/ttyUSB0', baudrate: int = 921600, modbus_port: int = 502, 
                  test_mode: bool = False):
         """
         Инициализация системы
@@ -550,6 +558,7 @@ class LaserGeometrySystem:
                 
                 # Проверяем команду от Modbus
                 current_cmd = self.get_current_command()
+               
                 
                 if current_cmd != self.previous_cmd:
                     print(f"📨 Получена команда: {current_cmd}")
@@ -1939,7 +1948,7 @@ class LaserGeometrySystem:
                 
                 # Вычисляем расстояние между датчиком 3 и центром пересечения
                 # Формула: (Эталонный диаметр фланца/2) + среднее датчика 3
-                distance_sensor3_to_center = reference_flange_diameter  + avg_sensor3
+                distance_sensor3_to_center = (reference_flange_diameter/2)  + avg_sensor3
                 print(f" [CMD=105] Расстояние между датчиком 3 и центром: {distance_sensor3_to_center:.3f} мм")
                 print(f" [CMD=105] Формула: ({reference_flange_diameter:.3f} / 2) + {avg_sensor3:.3f} = {distance_sensor3_to_center:.3f}")
                 
@@ -1996,6 +2005,67 @@ class LaserGeometrySystem:
                     return diameter
         except Exception as e:
             print(f" [CMD=105] Ошибка чтения эталонного диаметра фланца: {e}")
+        return 0.0
+
+    def read_recipe_flange_diameter(self) -> float:
+        """Чтение рецепта диаметра фланца из регистров 40388, 40389"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                values = self.modbus_server.slave_context.getValues(3, 388, 2)  # 40388-40389
+                if values and len(values) >= 2:
+                    high_word = int(values[0])  # 40388 - старший
+                    low_word = int(values[1])   # 40389 - младший
+                    diameter = self.doubleword_to_float(low_word, high_word)
+                    return diameter
+        except Exception as e:
+            print(f" Ошибка чтения рецепта диаметра фланца: {e}")
+        return 0.0
+    
+    def read_recipe_body_diameter(self) -> float:
+        """Чтение рецепта диаметра корпуса из регистров 40382, 40383"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                values = self.modbus_server.slave_context.getValues(3, 382, 2)  # 40382-40383
+                if values and len(values) >= 2:
+                    high_word = int(values[0])  # 40382 - старший
+                    low_word = int(values[1])   # 40383 - младший
+                    diameter = self.doubleword_to_float(low_word, high_word)
+                    return diameter
+        except Exception as e:
+            print(f" Ошибка чтения рецепта диаметра корпуса: {e}")
+        return 0.0
+
+    def read_upper_wall_offset_coeff(self) -> float:
+        """Коэффициент смещения толщины верхней стенки (40500-40501)"""
+        return self._read_offset_coeff(500)
+
+    def read_lower_wall_offset_coeff(self) -> float:
+        """Коэффициент смещения толщины нижней стенки (40502-40503)"""
+        return self._read_offset_coeff(502)
+
+    def read_body_diameter_offset_coeff(self) -> float:
+        """Коэффициент смещения диаметра корпуса (40504-40505)"""
+        return self._read_offset_coeff(504)
+
+    def read_flange_diameter_offset_coeff(self) -> float:
+        """Коэффициент смещения диаметра фланца (40506-40507)"""
+        return self._read_offset_coeff(506)
+
+    def read_bottom_thickness_offset_coeff(self) -> float:
+        """Коэффициент смещения толщины дна (40508-40509)"""
+        return self._read_offset_coeff(508)
+
+    def _read_offset_coeff(self, base_index: int) -> float:
+        """Общий метод чтения коэффициента смещения"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                values = self.modbus_server.slave_context.getValues(3, base_index, 2)
+                if values and len(values) >= 2:
+                    high_word = int(values[0])
+                    low_word = int(values[1])
+                    return self.doubleword_to_float(low_word, high_word)
+        except Exception as e:
+            print(f" Ошибка чтения коэффициента смещения (base_index={base_index}): {e}")
         return 0.0
     
     def write_distance_sensor3_to_center(self, distance: float):
@@ -2420,7 +2490,7 @@ class LaserGeometrySystem:
                 
                 # Вычисляем расстояние между датчиком 1 и центром пересечения
                 # Формула: (Эталонный диаметр/2) + среднее датчика 1
-                distance_1_center = reference_diameter  + avg_sensor1
+                distance_1_center = (reference_diameter/2)  + avg_sensor1
                 print(f" [CMD=102] Расстояние между датчиком 1 и центром: {distance_1_center:.3f} мм")
                 print(f" [CMD=102] Формула: ({reference_diameter:.3f} / 2) + {avg_sensor1:.3f} = {distance_1_center:.3f}")
                 
@@ -2889,10 +2959,11 @@ class LaserGeometrySystem:
                     
                     # Используем кешированное расстояние (вместо чтения из Modbus)
                     distance_1_2 = self.cached_distance_1_2
+                    wall_upper_offset = self.read_upper_wall_offset_coeff()
                     
                     if distance_1_2 is not None:
                         # Вычисляем толщину стенки по формуле (используем усредненные значения)
-                        wall_thickness = distance_1_2 - avg_sensor1 - avg_sensor2
+                        wall_thickness = distance_1_2 - avg_sensor1 - avg_sensor2 + wall_upper_offset
                         self.wall_thickness_buffer.append(wall_thickness)
                         
                         # Выводим текущие значения каждые 100 усредненных измерений (уменьшена частота для ускорения)
@@ -3345,18 +3416,30 @@ class LaserGeometrySystem:
                     distance_to_center_flange = self.cached_distance_sensor3_to_center  # Расстояние датчика 3 до центра (из команды 105)
                     distance_1_3 = self.cached_distance_1_3
                     distance_sensor4 = self.cached_distance_sensor4
+                    recipe_diametr_body = self.read_recipe_body_diameter()
+                    recipe_diametr_flange = self.read_recipe_flange_diameter()
+                    body_diameter_offset = self.read_body_diameter_offset_coeff()
+                    flange_diameter_offset = self.read_flange_diameter_offset_coeff()
+                    bottom_thickness_offset = self.read_bottom_thickness_offset_coeff()
                     
                     if (distance_to_center is not None and distance_to_center_flange is not None and 
                         distance_1_3 is not None and distance_sensor4 is not None):
                         
                         # 1) Диаметр корпуса (Датчик 1)
                         # Формула: (расстояние до центра - показание датчика 1) * 2
-                        body_diameter = distance_to_center - avg_sensor1
+                        if recipe_diametr_body and recipe_diametr_body > 0:
+                            body_diameter = (distance_to_center - avg_sensor1) + (recipe_diametr_body/2) + body_diameter_offset
+                        else:
+                            body_diameter = (distance_to_center - avg_sensor1) * 2 + body_diameter_offset
+
                         self.body_diameter_buffer.append(body_diameter)
                         
                         # 2) Диаметр фланца (Датчик 3)
                         # Формула: (расстояние датчика 3 до центра - показание датчика 3) * 2
-                        flange_diameter = distance_to_center_flange - avg_sensor3
+                        if recipe_diametr_flange and recipe_diametr_flange > 0: 
+                            flange_diameter = (distance_to_center_flange - avg_sensor3) + (recipe_diametr_flange/2) + flange_diameter_offset
+                        else:
+                            flange_diameter = (distance_to_center_flange - avg_sensor3) * 2 + flange_diameter_offset
                         self.flange_diameter_buffer.append(flange_diameter)
                         
                         # 3) Толщина фланца (Датчики 1,3)
@@ -3364,7 +3447,7 @@ class LaserGeometrySystem:
                         self.flange_thickness_buffer.append(flange_thickness)
                         
                         # 4) Толщина дна (Датчик 4)
-                        bottom_thickness = distance_sensor4 - avg_sensor4
+                        bottom_thickness = distance_sensor4 - avg_sensor4 + bottom_thickness_offset
                         self.bottom_thickness_buffer.append(bottom_thickness)
                         
                         # Выводим прогресс каждые 100 усредненных измерений
@@ -4051,7 +4134,7 @@ def main():
     print("=" * 60)
     
     # Настройки системы
-    PORT = 'COM11'  # Попробуйте другой порт если COM7 занят
+    PORT = '/dev/ttyUSB0'  # Измените при необходимости на другой ttyUSB/ttyACM порт
     BAUDRATE = 921600
     MODBUS_PORT = 502
     TEST_MODE = False  # Режим с реальными датчиками

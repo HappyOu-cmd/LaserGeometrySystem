@@ -262,6 +262,26 @@ class ModbusSlaveServer:
             # 40402, 40403: Толщина стенки (положительная негодная погрешность) (DoubleWord float)
             401: 0.0,  # Толщина стенки (положительная негодная погрешность) - младшее слово
             402: 0.0,  # Толщина стенки (положительная негодная погрешность) - старшее слово
+
+            # 40500, 40501: Коэффициент смещения толщины верхней стенки (DoubleWord float)
+            500: 0.0,  # Младшее слово
+            501: 0.0,  # Старшее слово
+
+            # 40502, 40503: Коэффициент смещения толщины нижней стенки (DoubleWord float)
+            502: 0.0,  # Младшее слово
+            503: 0.0,  # Старшее слово
+
+            # 40504, 40505: Коэффициент смещения диаметра корпуса (DoubleWord float)
+            504: 0.0,  # Младшее слово
+            505: 0.0,  # Старшее слово
+
+            # 40506, 40507: Коэффициент смещения диаметра фланца (DoubleWord float)
+            506: 0.0,  # Младшее слово
+            507: 0.0,  # Старшее слово
+
+            # 40508, 40509: Коэффициент смещения толщины дна (DoubleWord float)
+            508: 0.0,  # Младшее слово
+            509: 0.0,  # Старшее слово
         }
         
         # === INPUT REGISTERS - Результаты измерений ===
@@ -409,7 +429,7 @@ class ModbusSlaveServer:
         """Создание контекста Modbus с регистрами"""
         
         # Holding Registers (функции 3, 6, 16) - 40001-40500 (расширенный диапазон)
-        holding_block = ModbusSequentialDataBlock(1, [0] * 500)
+        holding_block = ModbusSequentialDataBlock(1, [0] * 520)
         
         # Input Registers (функция 4) - 30001-30500 (расширенный диапазон)
         input_block = ModbusSequentialDataBlock(1, [0] * 500)
@@ -696,12 +716,12 @@ class ModbusSlaveServer:
     def run_modbus_server(self, port, identity):
         """Запуск Modbus сервера"""
         try:
-            self.log_message(f"Запуск TCP сервера на 0.0.0.0:{port}")
+            self.log_message(f"Запуск TCP сервера на 192.168.1.50:{port}")
             # Для pymodbus 3.5.4 - упрощенный синтаксис
             StartTcpServer(
                 context=self.server_context, 
                 identity=identity, 
-                address=("0.0.0.0", port)
+                address=("192.168.1.50", port)
             )
         except Exception as e:
             self.log_message(f"Ошибка работы сервера: {e}")

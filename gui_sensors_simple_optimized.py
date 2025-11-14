@@ -89,7 +89,7 @@ class SensorGUISimpleOptimized:
         port_frame.pack(side=tk.LEFT, padx=10)
         
         ttk.Label(port_frame, text="COM порт:").pack()
-        self.port_var = tk.StringVar(value="COM7")
+        self.port_var = tk.StringVar(value="/dev/ttyUSB0")
         port_entry = ttk.Entry(port_frame, textvariable=self.port_var, width=10)
         port_entry.pack()
         
