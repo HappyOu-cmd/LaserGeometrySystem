@@ -1,0 +1,23 @@
+def read_upper_wall_offset_coeff(self) -> float:
+        """Коэффициент смещения толщины верхней стенки (40500-40501)"""
+        return self._read_offset_coeff(500)
+
+    def read_lower_wall_offset_coeff(self) -> float:
+        """Коэффициент смещения толщины нижней стенки (40502-40503)"""
+        return self._read_offset_coeff(502)
+
+    def read_body_diameter_offset_coeff(self) -> float:
+        """Коэффициент смещения диаметра корпуса (40504-40505)"""
+        return self._read_offset_coeff(504)
+
+    def read_flange_diameter_offset_coeff(self) -> float:
+        """Коэффициент смещения диаметра фланца (40506-40507)"""
+        return self._read_offset_coeff(506)
+
+    def read_flange_diameter_offset_positive_coeff(self) -> float:
+        """Коэффициент положительного смещения диаметра фланца (40508-40509)"""
+        return self._read_offset_coeff(508)
+
+    def read_bottom_thickness_offset_coeff(self) -> float:
+        """Коэффициент смещения толщины дна (40510-40511)"""
+        return self._read_offset_coeff(510)

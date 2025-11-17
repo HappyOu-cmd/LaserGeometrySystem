@@ -617,6 +617,37 @@ class LaserGeometrySystem:
     
     def handle_command(self, cmd: int):
         """Обработка команды и переход в соответствующее состояние"""
+        # Проверяем, идет ли активная калибровка (102 или 105)
+        # Если да, игнорируем команду 0 - не прерываем калибровку
+        if cmd == 0:
+            # Проверяем активные калибровки 102 и 105
+            is_calibration_active_102 = (
+                self.current_state == SystemState.CALIBRATE_FLANGE and 
+                hasattr(self, 'calibrate_flange_started') and 
+                not hasattr(self, 'calibrate_flange_completed')
+            )
+            is_calibration_active_105 = (
+                self.current_state == SystemState.CALIBRATE_FLANGE_DIAMETER and 
+                hasattr(self, 'calibrate_flange_diameter_started') and 
+                not hasattr(self, 'calibrate_flange_diameter_completed')
+            )
+            is_calibration_active_100 = (
+                self.current_state == SystemState.CALIBRATE_WALL and
+                getattr(self, 'calibration_in_progress', False)
+            )
+            is_calibration_active_101 = (
+                self.current_state == SystemState.CALIBRATE_BOTTOM and
+                (
+                    hasattr(self, 'calibrate_bottom_started') and
+                    not hasattr(self, 'calibrate_bottom_completed')
+                )
+            )
+            
+            if is_calibration_active_102 or is_calibration_active_105 or is_calibration_active_100 or is_calibration_active_101:
+                # Калибровка активна - игнорируем команду 0, не прерываем
+                print(f" [CMD=0] Игнорируем команду 0 - калибровка активна (завершение через несколько секунд)")
+                return  # Не обрабатываем команду 0, продолжаем калибровку
+        
         # Останавливаем все активные потоки при смене команды
         self.stop_all_streams()
         
@@ -854,22 +885,29 @@ class LaserGeometrySystem:
                 print(" [104→0] Отладка регистров завершена, возврат в IDLE")
             
             # === ЗАВЕРШЕНИЕ КАЛИБРОВОК 100/101/102/105 ПО КОМАНДЕ 0 ===
-            # При переходе CMD -> 0 завершаем калибровку: рассчитываем результаты и записываем их
             elif current_state_value == "CALIBRATE_WALL" and new_cmd == 0:
-                print(" [CALIBRATE_WALL→0] Завершение калибровки стенки, расчет результатов...")
-                self._finish_calibration_wall()
+                if getattr(self, 'calibration_wall_waiting_zero', False):
+                    self._finish_calibration_wall()
+                else:
+                    print(" [CALIBRATE_WALL→0] Калибровка еще выполняется, игнорируем CMD=0")
                 return
             elif current_state_value == "CALIBRATE_BOTTOM" and new_cmd == 0:
-                print(" [CALIBRATE_BOTTOM→0] Завершение калибровки дна, расчет результатов...")
-                self._finish_calibration_bottom()
+                if getattr(self, 'calibrate_bottom_waiting_zero', False):
+                    self._finish_calibration_bottom()
+                else:
+                    print(" [CALIBRATE_BOTTOM→0] Калибровка еще выполняется, игнорируем CMD=0")
                 return
             elif current_state_value == "CALIBRATE_FLANGE" and new_cmd == 0:
-                print(" [CALIBRATE_FLANGE→0] Завершение калибровки фланца, расчет результатов...")
-                self._finish_calibration_flange()
+                if getattr(self, 'calibrate_flange_waiting_zero', False):
+                    self._finish_calibration_flange()
+                else:
+                    print(" [CALIBRATE_FLANGE→0] Калибровка еще выполняется, игнорируем CMD=0")
                 return
             elif current_state_value == "CALIBRATE_FLANGE_DIAMETER" and new_cmd == 0:
-                print(" [CALIBRATE_FLANGE_DIAMETER→0] Завершение калибровки диаметра фланца, расчет результатов...")
-                self._finish_calibration_flange_diameter()
+                if getattr(self, 'calibrate_flange_diameter_waiting_zero', False):
+                    self._finish_calibration_flange_diameter()
+                else:
+                    print(" [CALIBRATE_FLANGE_DIAMETER→0] Калибровка еще выполняется, игнорируем CMD=0")
                 return
             
             # === ПРЕРЫВАНИЕ ЦИКЛА (ОШИБКИ) ===
@@ -1795,30 +1833,38 @@ class LaserGeometrySystem:
         """
         CMD=105: Калибровка диаметра фланца
         - Читаем эталонный диаметр фланца из регистров 40030-40031
-        - Непрерывно собираем данные от датчика 3 до получения CMD=0
-        - Расчет и запись результатов выполняется при переходе CMD -> 0
+        - Измеряем датчик 3 в течение 5 секунд и усредняем
+        - Вычисляем: Расстояние между датчиком 3 и центром = (Эталонный диаметр фланца/2) + среднее датчика 3
+        - Записываем результат в регистры 40032-40033
+        - Обновляем статус: 105 (калибровка) → 935 (завершено), ожидаем CMD=0
         """
+        cleanup_flags = ['calibrate_flange_diameter_started', 'calibrate_flange_diameter_start_time', 'calibrate_flange_diameter_completed']
+
+        if getattr(self, 'calibrate_flange_diameter_waiting_zero', False):
+            return
+
         if not self.sensors:
             self.finalize_calibration_failure(
                 105,
                 " [CMD=105] Ошибка: датчики не подключены!",
-                cleanup_flags=['calibrate_flange_diameter_started'],
+                cleanup_flags,
                 register_doublewords=[40032],
                 cache_attrs=['cached_distance_sensor3_to_center'],
             )
             return
         
         try:
-            # Инициализация при первом запуске
-            if not hasattr(self, 'calibrate_flange_diameter_started'):
-                self.calibration_in_progress = True
+            # Инициализация при первом запуске (всегда сбрасываем время при новом запуске)
+            if not hasattr(self, 'calibrate_flange_diameter_started') or not hasattr(self, 'calibrate_flange_diameter_start_time'):
                 self.calibrate_flange_diameter_started = True
+                self.calibrate_flange_diameter_measurement_duration = 5.0  # 5 секунд
+                self.calibrate_flange_diameter_start_time = time.time()
                 self.calibrate_flange_diameter_sensor3_buffer = []
                 self.calibrate_flange_diameter_measurement_count = 0
-                self.calibrate_flange_diameter_last_log_time = time.time()
                 
                 # Очищаем буферы серийного порта перед началом измерений
                 self.clear_serial_buffers()
+                self.flush_sensor_queue()
                 self.flush_sensor_queue()
                 
                 # Очищаем буфер датчика 3
@@ -1826,14 +1872,14 @@ class LaserGeometrySystem:
                 
                 # Читаем эталонный диаметр фланца из регистров 40030-40031
                 reference_flange_diameter = self.read_reference_flange_diameter()
-                print(f"🔧 НАЧАЛО КАЛИБРОВКИ ДИАМЕТРА ФЛАНЦА (CMD=105)")
+                print(f" [CMD=105] Начало калибровки диаметра фланца")
                 print(f" [CMD=105] Эталонный диаметр фланца: {reference_flange_diameter:.3f} мм")
                 
                 if reference_flange_diameter <= 0:
                     self.finalize_calibration_failure(
                         105,
                         " [CMD=105] ОШИБКА: Эталонный диаметр фланца должен быть больше 0!",
-                        cleanup_flags=['calibrate_flange_diameter_started'],
+                        cleanup_flags,
                         register_doublewords=[40032],
                         cache_attrs=['cached_distance_sensor3_to_center'],
                     )
@@ -1841,25 +1887,79 @@ class LaserGeometrySystem:
                 
                 # Устанавливаем статус калибровки
                 self.write_cycle_flag(105)
-                print(f" [CMD=105] Непрерывный сбор данных от датчика 3...")
+                print(f" [CMD=105] Измерение датчика 3 в течение 5 секунд...")
+                print(f" [CMD=105] ВНИМАНИЕ: Калибровка не будет прервана даже при команде 0 до завершения 5 секунд!")
             
-            # Непрерывный сбор данных (без таймаута)
-            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
-            if sensor3_mm is None:
-                time.sleep(0.002)
-                return
-                
-            # Сохраняем только валидные измерения датчика 3
-            if self.is_valid_measurement(sensor3_mm):
-                self.measurement_buffer['sensor3'].append(sensor3_mm)
-                self.calibrate_flange_diameter_sensor3_buffer.append(sensor3_mm)
-                self.calibrate_flange_diameter_measurement_count += 1
-
-            # Показываем прогресс раз в секунду
+            # Проверяем, не завершена ли уже калибровка
+            if hasattr(self, 'calibrate_flange_diameter_completed'):
+                return  # Калибровка уже завершена, просто выходим
+            
+            # Измеряем датчик 3 в течение 5 секунд
             current_time = time.time()
-            if current_time - getattr(self, 'calibrate_flange_diameter_last_log_time', 0) >= 1.0:
-                print(f" [CMD=105] Сбор данных... Измерений датчика 3: {self.calibrate_flange_diameter_measurement_count}")
-                self.calibrate_flange_diameter_last_log_time = current_time
+            elapsed = current_time - self.calibrate_flange_diameter_start_time
+            
+            if elapsed < self.calibrate_flange_diameter_measurement_duration:
+                # Устанавливаем статус 105 во время измерения (пока не закончится калибровка)
+                self.write_cycle_flag(105)
+                
+                # Выполняем QUAD измерение (но используем только датчик 3)
+                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+                if sensor3_mm is None:
+                    time.sleep(0.001)
+                    return
+                
+                # Сохраняем только измерения датчика 3
+                # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
+                if self.is_valid_measurement(sensor3_mm):
+                    self.measurement_buffer['sensor3'].append(sensor3_mm)
+                    self.calibrate_flange_diameter_sensor3_buffer.append(sensor3_mm)
+                    self.calibrate_flange_diameter_measurement_count += 1
+                
+                # Показываем прогресс каждую секунду
+                if int(elapsed) != int(elapsed - 0.1):  # Каждую секунду
+                    print(f" [CMD=105] Время: {elapsed:.1f}с, Измерений датчика 3: {self.calibrate_flange_diameter_measurement_count}")
+            else:
+                # Измерения завершены - вычисляем результат
+                # Проверяем, что прошло достаточно времени и есть измерения
+                if elapsed < 0.1:
+                    # Слишком рано - еще не успели накопить данные, продолжаем измерения
+                    return
+                
+                if len(self.calibrate_flange_diameter_sensor3_buffer) == 0:
+                    print(f" [CMD=105] Нет валидных измерений от датчика 3. Продолжаем калибровку...")
+                    self.calibrate_flange_diameter_start_time = time.time()
+                    return
+                
+                # Устанавливаем флаг завершения, чтобы не выполнять расчеты повторно
+                self.calibrate_flange_diameter_completed = True
+                
+                # Усредняем измерения датчика 3
+                avg_sensor3 = sum(self.calibrate_flange_diameter_sensor3_buffer) / len(self.calibrate_flange_diameter_sensor3_buffer)
+                print(f" [CMD=105] Среднее значение датчика 3: {avg_sensor3:.3f} мм (из {len(self.calibrate_flange_diameter_sensor3_buffer)} измерений)")
+                
+                # Читаем эталонный диаметр фланца
+                reference_flange_diameter = self.read_reference_flange_diameter()
+                
+                # Вычисляем расстояние между датчиком 3 и центром пересечения
+                # Формула: (Эталонный диаметр фланца/2) + среднее датчика 3
+                distance_sensor3_to_center = (reference_flange_diameter/2)  + avg_sensor3
+                print(f" [CMD=105] Расстояние между датчиком 3 и центром: {distance_sensor3_to_center:.3f} мм")
+                print(f" [CMD=105] Формула: ({reference_flange_diameter:.3f} / 2) + {avg_sensor3:.3f} = {distance_sensor3_to_center:.3f}")
+                
+                # Записываем результат в регистры 40032-40033
+                self.write_distance_sensor3_to_center(distance_sensor3_to_center)
+                
+                # Кешируем результат
+                self.cached_distance_sensor3_to_center = distance_sensor3_to_center
+                
+                # Устанавливаем статус завершения
+                self.write_cycle_flag(935)
+                
+                print(f" [CMD=105] КАЛИБРОВКА ДИАМЕТРА ФЛАНЦА ЗАВЕРШЕНА")
+                print(f" [CMD=105] Результат записан в регистры 40032-40033: {distance_sensor3_to_center:.3f} мм")
+                
+                self.calibrate_flange_diameter_waiting_zero = True
+                print(f" [CMD=105] Калибровка диаметра фланца завершена. Ожидаем CMD=0 для выхода.")
                 
         except Exception as e:
             print(f" [CMD=105] Ошибка калибровки диаметра фланца: {e}")
@@ -1867,8 +1967,8 @@ class LaserGeometrySystem:
             traceback.print_exc()
             self.finalize_calibration_failure(
                 105,
-                f" [CMD=105] Ошибка калибровки: {e}",
-                cleanup_flags=['calibrate_flange_diameter_started'],
+                " [CMD=105] Калибровка завершена с ошибкой",
+                cleanup_flags,
                 register_doublewords=[40032],
                 cache_attrs=['cached_distance_sensor3_to_center'],
             )
@@ -1964,6 +2064,64 @@ class LaserGeometrySystem:
                 print(f" [CMD=105] Записано расстояние датчик 3 - центр 40032-40033: {distance:.3f} мм (high: {int(high_word)}, low: {int(low_word)})")
         except Exception as e:
             print(f" [CMD=105] Ошибка записи расстояния датчик 3 - центр: {e}")
+
+    def _finish_calibration_wall(self):
+        self.write_cycle_flag(0)
+        self.clear_measurement_buffers()
+        self.clear_serial_buffers()
+        self.current_state = SystemState.IDLE
+        if hasattr(self, 'calibration_wall_waiting_zero'):
+            delattr(self, 'calibration_wall_waiting_zero')
+        print(" [CMD=100] CMD=0 получена. Калибровка стенки завершена.")
+
+    def _finish_calibration_bottom(self):
+        self.write_cycle_flag(0)
+        self.clear_measurement_buffers()
+        self.clear_serial_buffers()
+        self.current_state = SystemState.IDLE
+        if hasattr(self, 'calibrate_bottom_waiting_zero'):
+            delattr(self, 'calibrate_bottom_waiting_zero')
+        for attr in [
+            'calibrate_bottom_started',
+            'calibrate_bottom_start_time',
+            'calibrate_bottom_completed',
+            'calibrate_bottom_sensor4_buffer',
+            'calibrate_bottom_measurement_count',
+            '_reference_bottom_thickness',
+        ]:
+            if hasattr(self, attr):
+                delattr(self, attr)
+        print(" [CMD=101] CMD=0 получена. Калибровка дна завершена.")
+
+    def _finish_calibration_flange(self):
+        self.write_cycle_flag(0)
+        self.clear_measurement_buffers()
+        self.clear_serial_buffers()
+        self.current_state = SystemState.IDLE
+        if hasattr(self, 'calibrate_flange_waiting_zero'):
+            delattr(self, 'calibrate_flange_waiting_zero')
+        for attr in ['calibrate_flange_started', 'calibrate_flange_start_time', 'calibrate_flange_completed']:
+            if hasattr(self, attr):
+                delattr(self, attr)
+        print(" [CMD=102] CMD=0 получена. Калибровка эталонного диаметра завершена.")
+
+    def _finish_calibration_flange_diameter(self):
+        self.write_cycle_flag(0)
+        self.clear_measurement_buffers()
+        self.clear_serial_buffers()
+        self.current_state = SystemState.IDLE
+        if hasattr(self, 'calibrate_flange_diameter_waiting_zero'):
+            delattr(self, 'calibrate_flange_diameter_waiting_zero')
+        for attr in [
+            'calibrate_flange_diameter_started',
+            'calibrate_flange_diameter_start_time',
+            'calibrate_flange_diameter_completed',
+            'calibrate_flange_diameter_sensor3_buffer',
+            'calibrate_flange_diameter_measurement_count',
+        ]:
+            if hasattr(self, attr):
+                delattr(self, attr)
+        print(" [CMD=105] CMD=0 получена. Калибровка диаметра фланца завершена.")
 
     def read_register_40020_raw(self):
         """Чтение сырых и обработанных данных регистров 40052-40053"""
@@ -2201,39 +2359,45 @@ class LaserGeometrySystem:
         """
         CMD=102: Калибровка эталонного диаметра (фланца)
         - Читаем эталонный диаметр из регистров 40006-40007
-        - Непрерывно собираем данные от датчика 1 до получения CMD=0
-        - Расчет и запись результатов выполняется при переходе CMD -> 0
+        - Измеряем датчик 1 в течение 5 секунд и усредняем
+        - Вычисляем: Расстояние между датчиком 1 и центром = (Эталонный диаметр/2) + среднее датчика 1
+        - Записываем результат в регистры 40016-40017
+        - Обновляем статус: 102 (калибровка) → 932 (завершено), ожидаем CMD=0
         """
+        cleanup_flags = ['calibrate_flange_started', 'calibrate_flange_start_time', 'calibrate_flange_completed']
+
+        if getattr(self, 'calibrate_flange_waiting_zero', False):
+            return
+
         if not self.sensors:
             self.calibration_data['flange_distance_1_center'] = 0.0
             self.finalize_calibration_failure(
                 102,
                 " [CMD=102] Ошибка: датчики не подключены!",
-                cleanup_flags=['calibrate_flange_started'],
+                cleanup_flags,
                 register_doublewords=[40016],
                 cache_attrs=['cached_distance_to_center'],
             )
             return
         
         try:
-            # Инициализация при первом запуске
-            if not hasattr(self, 'calibrate_flange_started'):
-                self.calibration_in_progress = True
+            # Инициализация при первом запуске (всегда сбрасываем время при новом запуске)
+            if not hasattr(self, 'calibrate_flange_started') or not hasattr(self, 'calibrate_flange_start_time'):
                 self.calibrate_flange_started = True
+                self.calibrate_flange_measurement_duration = 5.0  # 5 секунд
+                self.calibrate_flange_start_time = time.time()
                 self.calibrate_flange_sensor1_buffer = []
                 self.calibrate_flange_measurement_count = 0
-                self.calibrate_flange_last_log_time = time.time()
                 
                 # Очищаем буферы серийного порта перед началом измерений
                 self.clear_serial_buffers()
-                self.flush_sensor_queue()
                 
                 # Очищаем буфер датчика 1
                 self.measurement_buffer['sensor1'].clear()
                 
                 # Читаем эталонный диаметр из регистров 40006-40007
                 reference_diameter = self.read_reference_diameter()
-                print(f"🔧 НАЧАЛО КАЛИБРОВКИ ЭТАЛОННОГО ДИАМЕТРА (CMD=102)")
+                print(f" [CMD=102] Начало калибровки эталонного диаметра")
                 print(f" [CMD=102] Эталонный диаметр: {reference_diameter:.3f} мм")
                 
                 if reference_diameter <= 0:
@@ -2241,7 +2405,7 @@ class LaserGeometrySystem:
                     self.finalize_calibration_failure(
                         102,
                         " [CMD=102] ОШИБКА: Эталонный диаметр должен быть больше 0!",
-                        cleanup_flags=['calibrate_flange_started'],
+                        cleanup_flags,
                         register_doublewords=[40016],
                         cache_attrs=['cached_distance_to_center'],
                     )
@@ -2249,25 +2413,80 @@ class LaserGeometrySystem:
                 
                 # Устанавливаем статус калибровки
                 self.write_cycle_flag(102)
-                print(f" [CMD=102] Непрерывный сбор данных от датчика 1...")
+                print(f" [CMD=102] Измерение датчика 1 в течение 5 секунд...")
+                print(f" [CMD=102] ВНИМАНИЕ: Калибровка не будет прервана даже при команде 0 до завершения 5 секунд!")
             
-            # Непрерывный сбор данных (без таймаута)
-            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
-            if sensor1_mm is None:
-                time.sleep(0.002)
-                return
-
-            # Сохраняем только валидные измерения датчика 1
-            if self.is_valid_measurement(sensor1_mm):
-                self.measurement_buffer['sensor1'].append(sensor1_mm)
-                self.calibrate_flange_sensor1_buffer.append(sensor1_mm)
-                self.calibrate_flange_measurement_count += 1
-
-            # Показываем прогресс раз в секунду
+            # Проверяем, не завершена ли уже калибровка
+            if hasattr(self, 'calibrate_flange_completed'):
+                return  # Калибровка уже завершена, просто выходим
+            
+            # Измеряем датчик 1 в течение 5 секунд
             current_time = time.time()
-            if current_time - getattr(self, 'calibrate_flange_last_log_time', 0) >= 1.0:
-                print(f" [CMD=102] Сбор данных... Измерений датчика 1: {self.calibrate_flange_measurement_count}")
-                self.calibrate_flange_last_log_time = current_time
+            elapsed = current_time - self.calibrate_flange_start_time
+            
+            if elapsed < self.calibrate_flange_measurement_duration:
+                # Выполняем QUAD измерение (но используем только датчик 1)
+                sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+                if sensor1_mm is None:
+                    time.sleep(0.001)
+                    return
+
+                # Сохраняем только измерения датчика 1
+                # Фильтруем некорректные измерения (None, 0, отрицательные, вне диапазона)
+                if self.is_valid_measurement(sensor1_mm):
+                    self.measurement_buffer['sensor1'].append(sensor1_mm)
+                    self.calibrate_flange_sensor1_buffer.append(sensor1_mm)
+                    self.calibrate_flange_measurement_count += 1
+                
+                # Показываем прогресс каждую секунду
+                if int(elapsed) != int(elapsed - 0.1):  # Каждую секунду
+                    print(f" [CMD=102] Время: {elapsed:.1f}с, Измерений датчика 1: {self.calibrate_flange_measurement_count}")
+            else:
+                # Измерения завершены - вычисляем результат
+                # Проверяем, что прошло достаточно времени и есть измерения
+                if elapsed < 0.1:
+                    # Слишком рано - еще не успели накопить данные, продолжаем измерения
+                    return
+                
+                if len(self.calibrate_flange_sensor1_buffer) == 0:
+                    print(f" [CMD=102] Нет валидных измерений от датчика 1. Продолжаем калибровку...")
+                    self.calibrate_flange_start_time = time.time()
+                    return
+                
+                # Устанавливаем флаг завершения, чтобы не выполнять расчеты повторно
+                self.calibrate_flange_completed = True
+                
+                # Усредняем измерения датчика 1
+                avg_sensor1 = sum(self.calibrate_flange_sensor1_buffer) / len(self.calibrate_flange_sensor1_buffer)
+                print(f" [CMD=102] Среднее значение датчика 1: {avg_sensor1:.3f} мм (из {len(self.calibrate_flange_sensor1_buffer)} измерений)")
+                
+                # Читаем эталонный диаметр
+                reference_diameter = self.read_reference_diameter()
+                
+                # Вычисляем расстояние между датчиком 1 и центром пересечения
+                # Формула: (Эталонный диаметр/2) + среднее датчика 1
+                distance_1_center = (reference_diameter/2)  + avg_sensor1
+                print(f" [CMD=102] Расстояние между датчиком 1 и центром: {distance_1_center:.3f} мм")
+                print(f" [CMD=102] Формула: ({reference_diameter:.3f} / 2) + {avg_sensor1:.3f} = {distance_1_center:.3f}")
+                
+                # Записываем результат в регистры 40016-40017
+                self.write_calibration_result_1_center(distance_1_center)
+                
+                # Кешируем результат
+                self.cached_distance_to_center = distance_1_center
+                
+                # Сохраняем в локальных данных
+                self.calibration_data['flange_distance_1_center'] = distance_1_center
+                
+                # Устанавливаем статус завершения
+                self.write_cycle_flag(932)
+                
+                print(f" [CMD=102] КАЛИБРОВКА ЭТАЛОННОГО ДИАМЕТРА ЗАВЕРШЕНА")
+                print(f" [CMD=102] Результат записан в регистры 40016-40017: {distance_1_center:.3f} мм")
+                
+                # Ждем команду 0 для выхода из калибровки
+                self.calibrate_flange_waiting_zero = True
+                print(f" [CMD=102] Калибровка эталонного диаметра завершена. Ожидаем CMD=0 для выхода.")
                 
         except Exception as e:
             print(f" [CMD=102] Ошибка калибровки эталонного диаметра: {e}")
@@ -2276,335 +2495,10 @@ class LaserGeometrySystem:
             self.calibration_data['flange_distance_1_center'] = 0.0
             self.finalize_calibration_failure(
                 102,
-                f" [CMD=102] Ошибка калибровки: {e}",
-                cleanup_flags=['calibrate_flange_started'],
+                " [CMD=102] Калибровка завершена с ошибкой",
+                cleanup_flags,
                 register_doublewords=[40016],
                 cache_attrs=['cached_distance_to_center'],
-            )
-    
-    def _finish_calibration_wall(self):
-        """Завершение калибровки стенки (CMD=100): расчет и запись результатов"""
-        try:
-            # Проверяем, что калибровка была инициализирована
-            if not hasattr(self, '_wall_calibration_initialized'):
-                print(" [CMD=100] ОШИБКА: Калибровка не была инициализирована!")
-                self.finalize_calibration_failure(
-                    100,
-                    " [CMD=100] ОШИБКА: Калибровка не была инициализирована!",
-                    cleanup_flags=['_wall_calibration_initialized', '_wall_reference_thickness'],
-                    register_doublewords=[40010, 40012],
-                    cache_attrs=['cached_distance_1_2', 'cached_distance_1_3'],
-                )
-                return
-            
-            # Проверяем наличие данных
-            if (len(self.measurement_buffer['sensor1']) == 0 or 
-                len(self.measurement_buffer['sensor2']) == 0 or 
-                len(self.measurement_buffer['sensor3']) == 0):
-                print(f" [CMD=100] ОШИБКА: Недостаточно данных для расчета!")
-                print(f" [CMD=100] Данные: Д1={len(self.measurement_buffer['sensor1'])}, Д2={len(self.measurement_buffer['sensor2'])}, Д3={len(self.measurement_buffer['sensor3'])}")
-                self.finalize_calibration_failure(
-                    100,
-                    " [CMD=100] ОШИБКА: Недостаточно данных для расчета!",
-                    cleanup_flags=['_wall_calibration_initialized', '_wall_reference_thickness'],
-                    register_doublewords=[40010, 40012],
-                    cache_attrs=['cached_distance_1_2', 'cached_distance_1_3'],
-                )
-                return
-            
-            # Усредняем измерения
-            try:
-                avg_sensor1, avg_sensor2, avg_sensor3 = self.calculate_averages()
-            except ValueError as e:
-                print(f" [CMD=100] ОШИБКА при усреднении: {e}")
-                self.finalize_calibration_failure(
-                    100,
-                    f" [CMD=100] ОШИБКА при усреднении: {e}",
-                    cleanup_flags=['_wall_calibration_initialized', '_wall_reference_thickness'],
-                    register_doublewords=[40010, 40012],
-                    cache_attrs=['cached_distance_1_2', 'cached_distance_1_3'],
-                )
-                return
-            
-            print(f" [CMD=100] Средние значения: Д1={avg_sensor1:.3f}мм, Д2={avg_sensor2:.3f}мм, Д3={avg_sensor3:.3f}мм")
-            
-            # Вычисляем расстояние между датчиками 1,2
-            reference_thickness = getattr(self, '_wall_reference_thickness', 0.0)
-            distance_1_2 = avg_sensor1 + avg_sensor2 + reference_thickness
-            print(f" [CMD=100] Расстояние между датчиками 1,2: {distance_1_2:.3f} мм")
-            
-            # Вычисляем расстояние между датчиками 1,3
-            distance_1_3 = avg_sensor1 - avg_sensor3
-            print(f" [CMD=100] Расстояние между датчиками 1,3: {distance_1_3:.3f} мм")
-            
-            # Записываем результаты
-            self.write_calibration_result_1_2(distance_1_2)
-            self.write_calibration_result_1_3(distance_1_3)
-            
-            # Сохраняем в локальных данных
-            self.calibration_data['wall_distance_1_2'] = distance_1_2
-            self.calibration_data['wall_distance_1_3'] = distance_1_3
-            
-            # Очищаем буферы после калибровки
-            self.clear_measurement_buffers()
-            self.clear_serial_buffers()
-            
-            # Очищаем флаги
-            if hasattr(self, '_wall_calibration_initialized'):
-                delattr(self, '_wall_calibration_initialized')
-            if hasattr(self, '_wall_reference_thickness'):
-                delattr(self, '_wall_reference_thickness')
-            if hasattr(self, 'wall_sample_count'):
-                delattr(self, 'wall_sample_count')
-            if hasattr(self, 'wall_last_log_time'):
-                delattr(self, 'wall_last_log_time')
-            
-            self.calibration_in_progress = False
-            self.write_cycle_flag(0)
-            print(" [CMD=100] КАЛИБРОВКА СТЕНКИ ЗАВЕРШЕНА УСПЕШНО")
-            
-        except Exception as e:
-            print(f" [CMD=100] ОШИБКА при завершении калибровки: {e}")
-            import traceback
-            traceback.print_exc()
-            self.calibration_data['wall_distance_1_2'] = 0.0
-            self.calibration_data['wall_distance_1_3'] = 0.0
-            self.finalize_calibration_failure(
-                100,
-                f" [CMD=100] Ошибка завершения калибровки: {e}",
-                cleanup_flags=['_wall_calibration_initialized', '_wall_reference_thickness'],
-                register_doublewords=[40010, 40012],
-                cache_attrs=['cached_distance_1_2', 'cached_distance_1_3'],
-            )
-    
-    def _finish_calibration_bottom(self):
-        """Завершение калибровки дна (CMD=101): расчет и запись результатов"""
-        try:
-            # Проверяем, что калибровка была инициализирована
-            if not hasattr(self, 'calibrate_bottom_started'):
-                print(" [CMD=101] ОШИБКА: Калибровка не была инициализирована!")
-                self.finalize_calibration_failure(
-                    101,
-                    " [CMD=101] ОШИБКА: Калибровка не была инициализирована!",
-                    cleanup_flags=['calibrate_bottom_started', '_reference_bottom_thickness'],
-                    register_doublewords=[40014],
-                    cache_attrs=['cached_distance_sensor4'],
-                )
-                return
-            
-            # Проверяем наличие данных
-            if not hasattr(self, 'calibrate_bottom_sensor4_buffer') or len(self.calibrate_bottom_sensor4_buffer) == 0:
-                print(f" [CMD=101] ОШИБКА: Недостаточно данных для расчета!")
-                self.finalize_calibration_failure(
-                    101,
-                    " [CMD=101] ОШИБКА: Недостаточно данных для расчета!",
-                    cleanup_flags=['calibrate_bottom_started', '_reference_bottom_thickness'],
-                    register_doublewords=[40014],
-                    cache_attrs=['cached_distance_sensor4'],
-                )
-                return
-            
-            # Усредняем измерения датчика 4
-            avg_sensor4 = sum(self.calibrate_bottom_sensor4_buffer) / len(self.calibrate_bottom_sensor4_buffer)
-            print(f" [CMD=101] Среднее значение датчика 4: {avg_sensor4:.3f} мм (из {len(self.calibrate_bottom_sensor4_buffer)} измерений)")
-            
-            # Вычисляем расстояние от датчика 4 до поверхности
-            reference_bottom_thickness = getattr(self, '_reference_bottom_thickness', 0.0)
-            distance_4_surface = avg_sensor4 + reference_bottom_thickness
-            print(f" [CMD=101] Расстояние от датчика 4 до поверхности: {distance_4_surface:.3f} мм")
-            
-            # Записываем результат
-            self.write_calibration_result_4_surface(distance_4_surface)
-            self.calibration_data['bottom_distance_4'] = distance_4_surface
-            self.cached_distance_sensor4 = distance_4_surface
-            
-            # Очищаем буферы
-            self.clear_measurement_buffers()
-            self.clear_serial_buffers()
-            
-            # Очищаем флаги
-            if hasattr(self, 'calibrate_bottom_started'):
-                delattr(self, 'calibrate_bottom_started')
-            if hasattr(self, '_reference_bottom_thickness'):
-                delattr(self, '_reference_bottom_thickness')
-            if hasattr(self, 'calibrate_bottom_sensor4_buffer'):
-                delattr(self, 'calibrate_bottom_sensor4_buffer')
-            if hasattr(self, 'calibrate_bottom_measurement_count'):
-                delattr(self, 'calibrate_bottom_measurement_count')
-            if hasattr(self, 'calibrate_bottom_last_log_time'):
-                delattr(self, 'calibrate_bottom_last_log_time')
-            
-            self.calibration_in_progress = False
-            self.write_cycle_flag(0)
-            print(" [CMD=101] КАЛИБРОВКА ДНА ЗАВЕРШЕНА УСПЕШНО")
-            
-        except Exception as e:
-            print(f" [CMD=101] ОШИБКА при завершении калибровки: {e}")
-            import traceback
-            traceback.print_exc()
-            self.calibration_data['bottom_distance_4'] = 0.0
-            self.finalize_calibration_failure(
-                101,
-                f" [CMD=101] Ошибка завершения калибровки: {e}",
-                cleanup_flags=['calibrate_bottom_started', '_reference_bottom_thickness'],
-                register_doublewords=[40014],
-                cache_attrs=['cached_distance_sensor4'],
-            )
-    
-    def _finish_calibration_flange(self):
-        """Завершение калибровки фланца (CMD=102): расчет и запись результатов"""
-        try:
-            # Проверяем, что калибровка была инициализирована
-            if not hasattr(self, 'calibrate_flange_started'):
-                print(" [CMD=102] ОШИБКА: Калибровка не была инициализирована!")
-                self.finalize_calibration_failure(
-                    102,
-                    " [CMD=102] ОШИБКА: Калибровка не была инициализирована!",
-                    cleanup_flags=['calibrate_flange_started'],
-                    register_doublewords=[40016],
-                    cache_attrs=['cached_distance_to_center'],
-                )
-                return
-            
-            # Проверяем наличие данных
-            if not hasattr(self, 'calibrate_flange_sensor1_buffer') or len(self.calibrate_flange_sensor1_buffer) == 0:
-                print(f" [CMD=102] ОШИБКА: Недостаточно данных для расчета!")
-                self.finalize_calibration_failure(
-                    102,
-                    " [CMD=102] ОШИБКА: Недостаточно данных для расчета!",
-                    cleanup_flags=['calibrate_flange_started'],
-                    register_doublewords=[40016],
-                    cache_attrs=['cached_distance_to_center'],
-                )
-                return
-            
-            # Усредняем измерения датчика 1
-            avg_sensor1 = sum(self.calibrate_flange_sensor1_buffer) / len(self.calibrate_flange_sensor1_buffer)
-            print(f" [CMD=102] Среднее значение датчика 1: {avg_sensor1:.3f} мм (из {len(self.calibrate_flange_sensor1_buffer)} измерений)")
-            
-            # Читаем эталонный диаметр
-            reference_diameter = self.read_reference_diameter()
-            
-            # Вычисляем расстояние между датчиком 1 и центром пересечения
-            distance_1_center = (reference_diameter / 2) + avg_sensor1
-            print(f" [CMD=102] Расстояние между датчиком 1 и центром: {distance_1_center:.3f} мм")
-            print(f" [CMD=102] Формула: ({reference_diameter:.3f} / 2) + {avg_sensor1:.3f} = {distance_1_center:.3f}")
-            
-            # Записываем результат
-            self.write_calibration_result_1_center(distance_1_center)
-            self.cached_distance_to_center = distance_1_center
-            self.calibration_data['flange_distance_1_center'] = distance_1_center
-            
-            # Очищаем буферы
-            self.clear_measurement_buffers()
-            self.clear_serial_buffers()
-            
-            # Очищаем флаги
-            if hasattr(self, 'calibrate_flange_started'):
-                delattr(self, 'calibrate_flange_started')
-            if hasattr(self, 'calibrate_flange_sensor1_buffer'):
-                delattr(self, 'calibrate_flange_sensor1_buffer')
-            if hasattr(self, 'calibrate_flange_measurement_count'):
-                delattr(self, 'calibrate_flange_measurement_count')
-            if hasattr(self, 'calibrate_flange_start_time'):
-                delattr(self, 'calibrate_flange_start_time')
-            if hasattr(self, 'calibrate_flange_measurement_duration'):
-                delattr(self, 'calibrate_flange_measurement_duration')
-            if hasattr(self, 'calibrate_flange_completed'):
-                delattr(self, 'calibrate_flange_completed')
-            
-            self.calibration_in_progress = False
-            self.write_cycle_flag(0)
-            print(" [CMD=102] КАЛИБРОВКА ФЛАНЦА ЗАВЕРШЕНА УСПЕШНО")
-            
-        except Exception as e:
-            print(f" [CMD=102] ОШИБКА при завершении калибровки: {e}")
-            import traceback
-            traceback.print_exc()
-            self.calibration_data['flange_distance_1_center'] = 0.0
-            self.finalize_calibration_failure(
-                102,
-                f" [CMD=102] Ошибка завершения калибровки: {e}",
-                cleanup_flags=['calibrate_flange_started'],
-                register_doublewords=[40016],
-                cache_attrs=['cached_distance_to_center'],
-            )
-    
-    def _finish_calibration_flange_diameter(self):
-        """Завершение калибровки диаметра фланца (CMD=105): расчет и запись результатов"""
-        try:
-            # Проверяем, что калибровка была инициализирована
-            if not hasattr(self, 'calibrate_flange_diameter_started'):
-                print(" [CMD=105] ОШИБКА: Калибровка не была инициализирована!")
-                self.finalize_calibration_failure(
-                    105,
-                    " [CMD=105] ОШИБКА: Калибровка не была инициализирована!",
-                    cleanup_flags=['calibrate_flange_diameter_started'],
-                    register_doublewords=[40032],
-                    cache_attrs=['cached_distance_sensor3_to_center'],
-                )
-                return
-            
-            # Проверяем наличие данных
-            if not hasattr(self, 'calibrate_flange_diameter_sensor3_buffer') or len(self.calibrate_flange_diameter_sensor3_buffer) == 0:
-                print(f" [CMD=105] ОШИБКА: Недостаточно данных для расчета!")
-                self.finalize_calibration_failure(
-                    105,
-                    " [CMD=105] ОШИБКА: Недостаточно данных для расчета!",
-                    cleanup_flags=['calibrate_flange_diameter_started'],
-                    register_doublewords=[40032],
-                    cache_attrs=['cached_distance_sensor3_to_center'],
-                )
-                return
-            
-            # Усредняем измерения датчика 3
-            avg_sensor3 = sum(self.calibrate_flange_diameter_sensor3_buffer) / len(self.calibrate_flange_diameter_sensor3_buffer)
-            print(f" [CMD=105] Среднее значение датчика 3: {avg_sensor3:.3f} мм (из {len(self.calibrate_flange_diameter_sensor3_buffer)} измерений)")
-            
-            # Читаем эталонный диаметр фланца
-            reference_flange_diameter = self.read_reference_flange_diameter()
-            
-            # Вычисляем расстояние между датчиком 3 и центром пересечения
-            distance_sensor3_to_center = (reference_flange_diameter / 2) + avg_sensor3
-            print(f" [CMD=105] Расстояние между датчиком 3 и центром: {distance_sensor3_to_center:.3f} мм")
-            print(f" [CMD=105] Формула: ({reference_flange_diameter:.3f} / 2) + {avg_sensor3:.3f} = {distance_sensor3_to_center:.3f}")
-            
-            # Записываем результат
-            self.write_distance_sensor3_to_center(distance_sensor3_to_center)
-            self.cached_distance_sensor3_to_center = distance_sensor3_to_center
-            
-            # Очищаем буферы
-            self.clear_measurement_buffers()
-            self.clear_serial_buffers()
-            
-            # Очищаем флаги
-            if hasattr(self, 'calibrate_flange_diameter_started'):
-                delattr(self, 'calibrate_flange_diameter_started')
-            if hasattr(self, 'calibrate_flange_diameter_sensor3_buffer'):
-                delattr(self, 'calibrate_flange_diameter_sensor3_buffer')
-            if hasattr(self, 'calibrate_flange_diameter_measurement_count'):
-                delattr(self, 'calibrate_flange_diameter_measurement_count')
-            if hasattr(self, 'calibrate_flange_diameter_start_time'):
-                delattr(self, 'calibrate_flange_diameter_start_time')
-            if hasattr(self, 'calibrate_flange_diameter_measurement_duration'):
-                delattr(self, 'calibrate_flange_diameter_measurement_duration')
-            if hasattr(self, 'calibrate_flange_diameter_completed'):
-                delattr(self, 'calibrate_flange_diameter_completed')
-            
-            self.calibration_in_progress = False
-            self.write_cycle_flag(0)
-            print(" [CMD=105] КАЛИБРОВКА ДИАМЕТРА ФЛАНЦА ЗАВЕРШЕНА УСПЕШНО")
-            
-        except Exception as e:
-            print(f" [CMD=105] ОШИБКА при завершении калибровки: {e}")
-            import traceback
-            traceback.print_exc()
-            self.finalize_calibration_failure(
-                105,
-                f" [CMD=105] Ошибка завершения калибровки: {e}",
-                cleanup_flags=['calibrate_flange_diameter_started'],
-                register_doublewords=[40032],
-                cache_attrs=['cached_distance_sensor3_to_center'],
             )
     
     def read_reference_thickness(self) -> float:
