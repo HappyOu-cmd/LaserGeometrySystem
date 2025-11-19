@@ -42,9 +42,20 @@ class ModbusDatabaseIntegration:
             (40502, "Коэффициент смещения толщины нижней стенки"),
             (40504, "Коэффициент смещения диаметра корпуса"),
             (40506, "Коэффициент смещения диаметра фланца"),
-            (40508, "Коэффициент положительного смещения диаметра фланца"),
-            (40510, "Коэффициент смещения толщины дна"),
+            (40508, "Коэффициент смещения толщины дна"),
+            (40511, "Коэффициент экстраполяции толщины верхней стенки"),
+            (40513, "Коэффициент экстраполяции толщины нижней стенки"),
+            (40515, "Коэффициент экстраполяции диаметра корпуса"),
+            (40517, "Коэффициент экстраполяции диаметра фланца"),
+            (40519, "Коэффициент экстраполяции толщины дна"),
+            (40404, "Начало диапазона для дискретного сигнала"),
+            (40406, "Конец диапазона для дискретного сигнала"),
         ]
+        
+        # Отдельно фиксируем регистры экстраполяции, т.к. их адреса в словаре offset на 1 меньше реального
+        self.extrapolation_registers = {
+            40511, 40512, 40513, 40514, 40515, 40516, 40517, 40518, 40519, 40520
+        }
         
         # DoubleWord пары INTEGER (большие числа, не float)
         # Отключено: сохраняем только указанные величины
@@ -100,7 +111,11 @@ class ModbusDatabaseIntegration:
                 # Мониторим DoubleWord FLOAT пары Holding Registers
                 for address, description in self.holding_doubleword_pairs:
                     try:
-                        addr_idx = address - 40000
+                        # Для регистров экстраполяции используем addr_idx = address - 40001 (ModbusSequentialDataBlock начинается с 1)
+                        if address in self.extrapolation_registers:
+                            addr_idx = address - 40001
+                        else:
+                            addr_idx = address - 40000
                         values = self.modbus_server.slave_context.getValues(3, addr_idx, 2)
                         if values and len(values) == 2:
                             # ВАЖНО: При записи в регистры используется порядок:
@@ -213,8 +228,8 @@ class ModbusDatabaseIntegration:
                 if address in loaded_addresses:
                     continue  # Уже загружен как часть DoubleWord пары
                 
-                # Исключаем регистр 40057-40058 из загрузки (записывается только ПЛК/HMI)
-                if address == 40057 or address == 40058:
+                # Исключаем регистры 40057-40060 из загрузки (записывается только ПЛК/HMI)
+                if address == 40057 or address == 40058 or address == 40059 or address == 40060:
                     continue  # Пропускаем регистр измеренной высоты - он записывается только ПЛК
                 
                 # Проверяем, является ли это DoubleWord регистром по наличию float_value или is_float_display
@@ -230,7 +245,10 @@ class ModbusDatabaseIntegration:
                         # Это второй регистр пары (address+1), пропускаем - он будет загружен вместе с первым
                         continue
                     
-                    addr = address - 40000  # Конвертируем в индекс pymodbus
+                    if address in self.extrapolation_registers:
+                        addr = address - 40001  # Для регистров экстраполяции
+                    else:
+                        addr = address - 40000  # Для остальных регистров
                     value_low = reg['value_low']
                     value_high = reg['value_high']
                     

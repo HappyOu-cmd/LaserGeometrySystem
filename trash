@@ -1,23 +1,43 @@
-def read_upper_wall_offset_coeff(self) -> float:
-        """Коэффициент смещения толщины верхней стенки (40500-40501)"""
-        return self._read_offset_coeff(500)
+def read_range_start(self) -> float:
+        """Чтение начала диапазона из регистров 40404-40405"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                # 40404-40405 -> индексы 403-404
+                values = self.modbus_server.slave_context.getValues(3, 403, 2)
+                if values and len(values) >= 2:
+                    low_word = int(values[0])  # 40404 - младшее слово
+                    high_word = int(values[1])  # 40405 - старшее слово
+                    return self.doubleword_to_float(low_word, high_word)
+        except Exception as e:
+            print(f" [CMD=106] Ошибка чтения начала диапазона: {e}")
+        return 0.0
+    
+    def read_range_end(self) -> float:
+        """Чтение конца диапазона из регистров 40406-40407"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                # 40406-40407 -> индексы 405-406
+                values = self.modbus_server.slave_context.getValues(3, 405, 2)
+                if values and len(values) >= 2:
+                    low_word = int(values[0])  # 40406 - младшее слово
+                    high_word = int(values[1])  # 40407 - старшее слово
+                    return self.doubleword_to_float(low_word, high_word)
+        except Exception as e:
+            print(f" [CMD=106] Ошибка чтения конца диапазона: {e}")
+        return 0.0
 
-    def read_lower_wall_offset_coeff(self) -> float:
-        """Коэффициент смещения толщины нижней стенки (40502-40503)"""
-        return self._read_offset_coeff(502)
-
-    def read_body_diameter_offset_coeff(self) -> float:
-        """Коэффициент смещения диаметра корпуса (40504-40505)"""
-        return self._read_offset_coeff(504)
-
-    def read_flange_diameter_offset_coeff(self) -> float:
-        """Коэффициент смещения диаметра фланца (40506-40507)"""
-        return self._read_offset_coeff(506)
-
-    def read_flange_diameter_offset_positive_coeff(self) -> float:
-        """Коэффициент положительного смещения диаметра фланца (40508-40509)"""
-        return self._read_offset_coeff(508)
-
-    def read_bottom_thickness_offset_coeff(self) -> float:
-        """Коэффициент смещения толщины дна (40510-40511)"""
-        return self._read_offset_coeff(510)
+        
+     def read_reference_flange_diameter(self) -> float:
+        """Чтение эталонного диаметра фланца из регистров 40030, 40031"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                # HMI: старшее слово в 40030, младшее в 40031
+                values = self.modbus_server.slave_context.getValues(3, 30, 2)  # 40030-40031 -> индексы 29-30
+                if values and len(values) >= 2:
+                    high_word = int(values[0])  # 40030 - старший
+                    low_word = int(values[1])  # 40031 - младший
+                    diameter = self.doubleword_to_float(low_word, high_word)
+                    return diameter
+        except Exception as e:
+            print(f" [CMD=105] Ошибка чтения эталонного диаметра фланца: {e}")
+        return 0.0

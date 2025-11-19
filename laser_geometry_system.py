@@ -114,6 +114,7 @@ class SystemState(Enum):
     CALIBRATE_HEIGHT = "CALIBRATE_HEIGHT"
     CALIBRATE_FLANGE_DIAMETER = "CALIBRATE_FLANGE_DIAMETER"
     DEBUG_REGISTERS = "DEBUG_REGISTERS"
+    CONFIGURE_SENSOR3_RANGE = "CONFIGURE_SENSOR3_RANGE"  # CMD=106: настройка диапазонов датчика 3
     
     # Измерение высоты
     MEASURE_HEIGHT_PROCESS = "MEASURE_HEIGHT_PROCESS"      # CMD=9: поиск препятствия и сбор данных
@@ -272,7 +273,6 @@ class LaserGeometrySystem:
         # Расчетные буферы для команды 11
         self.body_diameter_buffer = []    # Буфер диаметра корпуса (датчик 1)
         self.flange_diameter_buffer = []  # Буфер диаметра фланца (датчик 3)
-        self.flange_thickness_buffer = [] # Буфер толщины фланца (датчики 1,3)
         self.bottom_thickness_buffer = [] # Буфер толщины дна (датчик 4)
         
         # Буферы для команды 12 (измерение нижней стенки)
@@ -641,6 +641,9 @@ class LaserGeometrySystem:
             self.current_state = SystemState.DEBUG_REGISTERS
         elif cmd == 105:
             self.current_state = SystemState.CALIBRATE_FLANGE_DIAMETER
+        elif cmd == 106:
+            # Команда 106: Настройка диапазонов для дискретного сигнала датчика 3
+            self.current_state = SystemState.CONFIGURE_SENSOR3_RANGE
             
         # Измерение верхней стенки
         elif cmd == 10:
@@ -777,7 +780,6 @@ class LaserGeometrySystem:
                 # Очищаем буферы рассчитанных значений для фланца
                 self.body_diameter_buffer = []
                 self.flange_diameter_buffer = []
-                self.flange_thickness_buffer = []
                 self.bottom_thickness_buffer = []
                 print(" [11→12] Все буферы измерения фланца очищены")
             
@@ -1121,11 +1123,12 @@ class LaserGeometrySystem:
             parameters = [
                 {
                     'name': 'height',
-                    'measured_regs': [(30040, 30041), (30042, 30043), (30044, 30045)],  # макс, сред, мин
+                    'measured_regs': [(40057, 40058)],  # измеренная высота с ПЛК (одно значение)
                     'base_regs': (40376, 40377),  # базовое значение
                     'cond_bad_regs': (40378, 40379),  # условно-негодная погрешность
                     'bad_regs': (40380, 40381),  # негодная погрешность
-                    'check_type': 'one_sided'  # односторонняя проверка
+                    'check_type': 'one_sided',  # односторонняя проверка
+                    'single_value': True  # значение приходит от ПЛК в 40057-40058
                 },
                 {
                     'name': 'upper_wall',
@@ -1137,11 +1140,12 @@ class LaserGeometrySystem:
                 },
                 {
                     'name': 'flange_thickness',
-                    'measured_regs': [(30034, 30035), (30036, 30037), (30038, 30039)],
+                    'measured_regs': [(40059, 40060)],  # Измеренная толщина фланца с ПК (один регистр)
                     'base_regs': (40370, 40371),
                     'cond_bad_regs': (40372, 40373),
                     'bad_regs': (40374, 40375),
-                    'check_type': 'one_sided'  # односторонняя проверка
+                    'check_type': 'one_sided',  # односторонняя проверка
+                    'single_value': True  # Флаг: одно значение вместо трех (макс/сред/мин)
                 },
                 {
                     'name': 'body_diameter',
@@ -1193,34 +1197,85 @@ class LaserGeometrySystem:
                 
                 # Читаем измеренные значения
                 measured_values = []
-                for reg_pair in param['measured_regs']:
-                    value = self.read_float_from_registers(reg_pair, 'input')
-                    measured_values.append(value)
+                
+                # Специальная обработка для flange_thickness (читаем из holding регистра 40059-40060)
+                if param.get('single_value', False):
+                    # Для одного значения читаем из соответствующего регистра
+                    if param['name'] == 'flange_thickness':
+                        value = self.read_measured_flange_thickness()
+                        if value is None:
+                            print(f" [CMD=16] ОШИБКА: Не удалось прочитать измеренную толщину фланца из 40059-40060!")
+                            value = 0.0  # Значение по умолчанию
+                        measured_values = [value]
+                    elif param['name'] == 'height':
+                        value = self.read_measured_height()
+                        if value is None:
+                            print(f" [CMD=16] ОШИБКА: Не удалось прочитать измеренную высоту из 40057-40058!")
+                            value = 0.0  # Значение по умолчанию
+                        measured_values = [value]
+                    else:
+                        # Для других параметров с одним значением читаем как раньше (из input регистра)
+                        value = self.read_float_from_registers(param['measured_regs'][0], 'input')
+                        measured_values = [value]
+                else:
+                    # Для параметров с тремя значениями (макс, сред, мин)
+                    for reg_pair in param['measured_regs']:
+                        value = self.read_float_from_registers(reg_pair, 'input')
+                        measured_values.append(value)
                 
                 # Сохраняем значения в measurement_data
-                measurement_data[f"{param['name']}_max"] = measured_values[0]
-                measurement_data[f"{param['name']}_avg"] = measured_values[1]
-                measurement_data[f"{param['name']}_min"] = measured_values[2]
+                if param.get('single_value', False):
+                    # Для одного значения сохраняем как среднее
+                    measurement_data[f"{param['name']}_avg"] = measured_values[0]
+                    measurement_data[f"{param['name']}_max"] = measured_values[0]
+                    measurement_data[f"{param['name']}_min"] = measured_values[0]
+                else:
+                    # Для трех значений
+                    measurement_data[f"{param['name']}_max"] = measured_values[0]
+                    measurement_data[f"{param['name']}_avg"] = measured_values[1]
+                    measurement_data[f"{param['name']}_min"] = measured_values[2]
                 
-                # Выводим проверяемый параметр
+                # Выводим проверяемый параметр и диапазоны допуска
                 print(f"\n === {param['name'].upper()} ({param['check_type']}) ===")
+                if param['check_type'] == 'two_sided':
+                    print(f"   БАЗА={base_value:.3f}мм | "
+                          f"Условно-негодная (ниже)={base_value + cond_bad_error:.3f}мм | "
+                          f"Негодная (ниже)={base_value + bad_error:.3f}мм | "
+                          f"Негодная (выше)={base_value + (positive_bad_error if positive_bad_error is not None else 0):.3f}мм")
+                else:
+                    print(f"   БАЗА={base_value:.3f}мм | "
+                          f"Условно-негодная граница={base_value + cond_bad_error:.3f}мм | "
+                          f"Негодная граница={base_value + bad_error:.3f}мм")
                 
                 # Проверяем только выбранные значения
                 param_errors = []
-                value_names = ['МАКС', 'СРЕД', 'МИН']
-                for idx in check_indices:
-                    measured = measured_values[idx]
-                    
-                    # Выбираем метод проверки в зависимости от типа
+                if param.get('single_value', False):
+                    # Для одного значения проверяем только его
+                    measured = measured_values[0]
                     if param['check_type'] == 'two_sided':
                         status = self.check_single_value_with_upper_limit(
                             measured, base_value, cond_bad_error, bad_error, positive_bad_error
                         )
                     else:  # one_sided
                         status = self.check_single_value(measured, base_value, cond_bad_error, bad_error)
-                    
                     param_errors.append(status)
-                    print(f" [{value_names[idx]}] {measured:.3f} → {status}")
+                    print(f" [ИЗМЕРЕНИЕ] {measured:.3f} → {status}")
+                else:
+                    # Для трех значений проверяем выбранные индексы
+                    value_names = ['МАКС', 'СРЕД', 'МИН']
+                    for idx in check_indices:
+                        measured = measured_values[idx]
+                        
+                        # Выбираем метод проверки в зависимости от типа
+                        if param['check_type'] == 'two_sided':
+                            status = self.check_single_value_with_upper_limit(
+                                measured, base_value, cond_bad_error, bad_error, positive_bad_error
+                            )
+                        else:  # one_sided
+                            status = self.check_single_value(measured, base_value, cond_bad_error, bad_error)
+                        
+                        param_errors.append(status)
+                        print(f" [{value_names[idx]}] {measured:.3f} → {status}")
                 
                 # Определяем статус параметра (худший из проверенных)
                 if "BAD" in param_errors:
@@ -1582,7 +1637,6 @@ class LaserGeometrySystem:
         # Буферы диаметров и толщин - очищаем при каждом новом измерении
         self.body_diameter_buffer = []
         self.flange_diameter_buffer = []
-        self.flange_thickness_buffer = []
         self.bottom_thickness_buffer = []
         
         # Буферы команды 12
@@ -1626,6 +1680,8 @@ class LaserGeometrySystem:
             self.handle_calibrate_height_state()
         elif self.current_state == SystemState.CALIBRATE_FLANGE_DIAMETER:
             self.handle_calibrate_flange_diameter_state()
+        elif self.current_state == SystemState.CONFIGURE_SENSOR3_RANGE:
+            self.handle_configure_sensor3_range_state()
         elif self.current_state == SystemState.DEBUG_REGISTERS:
             self.handle_debug_registers_state()
             
@@ -1887,6 +1943,220 @@ class LaserGeometrySystem:
         except Exception as e:
             print(f" [CMD=105] Ошибка чтения эталонного диаметра фланца: {e}")
         return 0.0
+    
+    def handle_configure_sensor3_range_state(self):
+        """
+        CMD=106: Настройка диапазонов для дискретного сигнала датчика 3
+        - Читаем начало диапазона из регистров 40404-40405 (в мм)
+        - Читаем конец диапазона из регистров 40406-40407 (в мм)
+        - Вычисляем значения для протокола RIFTEK по формуле
+        - Записываем параметры 0Ch-0Fh в датчик 3
+        - Сохраняем параметры в FLASH память датчика
+        """
+        if not self.sensors or not self.sensors.ser:
+            print(" [CMD=106] Ошибка: датчики не подключены!")
+            self.write_cycle_flag(-1)
+            self.current_state = SystemState.ERROR
+            return
+        
+        try:
+            # Инициализация при первом запуске
+            if not hasattr(self, 'configure_sensor3_range_started'):
+                self.configure_sensor3_range_started = True
+                print(f"🔧 НАЧАЛО НАСТРОЙКИ ДИАПАЗОНОВ ДАТЧИКА 3 (CMD=106)")
+                
+                # Читаем начало диапазона из регистров 40404-40405
+                range_start_mm = self.read_range_start()
+                print(f" [CMD=106] Начало диапазона: {range_start_mm:.3f} мм")
+                
+                # Читаем конец диапазона из регистров 40406-40407
+                range_end_mm = self.read_range_end()
+                print(f" [CMD=106] Конец диапазона: {range_end_mm:.3f} мм")
+                
+                # Вычисляем значения для протокола RIFTEK
+                # Формула: riftek_value = int((16384/25) * (mm_value - 25))
+                riftek_value_min = int((16384 / 25) * (range_start_mm - 20))
+                riftek_value_max = int((16384 / 25) * (range_end_mm - 20))
+                
+                # Ограничиваем значения диапазоном 0-16383
+                riftek_value_min = max(0, min(16383, riftek_value_min))
+                riftek_value_max = max(0, min(16383, riftek_value_max))
+                
+                print(f" [CMD=106] Значение RIFTEK (начало): {riftek_value_min}")
+                print(f" [CMD=106] Значение RIFTEK (конец): {riftek_value_max}")
+                
+                # Записываем параметры в датчик 3 (адрес 0x03)
+                sensor_address = 3
+                
+                # Параметр 0Ch - младший байт начала окна
+                if not self.write_riftek_parameter(sensor_address, 0x0C, riftek_value_min & 0xFF):
+                    raise Exception("Ошибка записи параметра 0Ch")
+                
+                # Параметр 0Dh - старший байт начала окна
+                if not self.write_riftek_parameter(sensor_address, 0x0D, (riftek_value_min >> 8) & 0xFF):
+                    raise Exception("Ошибка записи параметра 0Dh")
+                
+                # Параметр 0Eh - младший байт конца окна
+                if not self.write_riftek_parameter(sensor_address, 0x0E, riftek_value_max & 0xFF):
+                    raise Exception("Ошибка записи параметра 0Eh")
+                
+                # Параметр 0Fh - старший байт конца окна
+                if not self.write_riftek_parameter(sensor_address, 0x0F, (riftek_value_max >> 8) & 0xFF):
+                    raise Exception("Ошибка записи параметра 0Fh")
+                
+                print(" [CMD=106] Параметры записаны в датчик 3")
+                
+                # Сохраняем параметры в FLASH память
+                if not self.save_riftek_parameters_to_flash(sensor_address):
+                    raise Exception("Ошибка сохранения параметров в FLASH")
+                
+                print(" [CMD=106] Параметры сохранены в FLASH память датчика 3")
+                
+                # Устанавливаем статус успешного завершения
+                self.write_cycle_flag(106)
+                print(" [CMD=106] Настройка диапазонов завершена успешно")
+                
+                # Задержка перед сбросом команды
+                time.sleep(1)
+                
+                # Переходим в IDLE и сбрасываем команду
+                self.current_state = SystemState.IDLE
+                self.reset_command()
+                if hasattr(self, 'configure_sensor3_range_started'):
+                    delattr(self, 'configure_sensor3_range_started')
+                
+        except Exception as e:
+            print(f" [CMD=106] Ошибка настройки диапазонов: {e}")
+            import traceback
+            traceback.print_exc()
+            self.write_cycle_flag(-1)
+            
+            # Задержка перед сбросом команды при ошибке
+            time.sleep(1)
+            
+            self.reset_command()
+            self.current_state = SystemState.ERROR
+            if hasattr(self, 'configure_sensor3_range_started'):
+                delattr(self, 'configure_sensor3_range_started')
+    
+    def read_range_start(self) -> float:
+        """Чтение начала диапазона из регистров 40404-40405"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                # 40404-40405 -> индексы 403-404
+                # HMI: старшее слово в 40404, младшее в 40405
+                values = self.modbus_server.slave_context.getValues(3, 404, 2)
+                if values and len(values) >= 2:
+                    high_word = int(values[0])  # 40404 - старшее слово
+                    low_word = int(values[1])  # 40405 - младшее слово
+                    return self.doubleword_to_float(low_word, high_word)
+        except Exception as e:
+            print(f" [CMD=106] Ошибка чтения начала диапазона: {e}")
+        return 0.0
+    
+    def read_range_end(self) -> float:
+        """Чтение конца диапазона из регистров 40406-40407"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                # 40406-40407 -> индексы 405-406
+                # HMI: старшее слово в 40406, младшее в 40407
+                values = self.modbus_server.slave_context.getValues(3, 406, 2)
+                if values and len(values) >= 2:
+                    high_word = int(values[0])  # 40406 - старшее слово
+                    low_word = int(values[1])  # 40407 - младшее слово
+                    return self.doubleword_to_float(low_word, high_word)
+        except Exception as e:
+            print(f" [CMD=106] Ошибка чтения конца диапазона: {e}")
+        return 0.0
+    
+    def write_riftek_parameter(self, sensor_address: int, param_code: int, param_value: int) -> bool:
+        """
+        Запись параметра в датчик по протоколу RIFTEK
+        
+        Args:
+            sensor_address: Адрес датчика (1-4)
+            param_code: Код параметра (0x00-0xFF)
+            param_value: Значение параметра (0-255 для однобайтных параметров)
+            
+        Returns:
+            True если команда отправлена успешно
+        """
+        try:
+            if not self.sensors or not self.sensors.ser:
+                return False
+            
+            # Формат команды записи параметра (03h):
+            # Байт 0: 0|ADR (адрес датчика, старший бит = 0)
+            # Байт 1: 1|000|COD (код запроса 03h = 0x83)
+            # Байт 2: 1|SB|CNT|MSG[0] lo (младшая тетрада кода параметра)
+            # Байт 3: 1|SB|CNT|MSG[0] hi (старшая тетрада кода параметра)
+            # Байт 4: 1|SB|CNT|MSG[1] lo (младшая тетрада значения параметра)
+            # Байт 5: 1|SB|CNT|MSG[1] hi (старшая тетрада значения параметра)
+            
+            # Код параметра передается потетрадно
+            param_code_lo = param_code & 0x0F
+            param_code_hi = (param_code >> 4) & 0x0F
+            
+            # Значение параметра передается потетрадно
+            param_value_lo = param_value & 0x0F
+            param_value_hi = (param_value >> 4) & 0x0F
+            
+            # Формируем команду
+            command = bytes([
+                sensor_address,  # Байт 0: адрес датчика
+                0x83,  # Байт 1: код запроса 03h (0x83 = 1|000|0011)
+                0x80 | param_code_lo,  # Байт 2: младшая тетрада кода параметра
+                0x80 | param_code_hi,  # Байт 3: старшая тетрада кода параметра
+                0x80 | param_value_lo,  # Байт 4: младшая тетрада значения
+                0x80 | param_value_hi,  # Байт 5: старшая тетрада значения
+            ])
+            
+            # Отправляем команду
+            self.sensors.ser.write(command)
+            time.sleep(0.01)  # Небольшая задержка для обработки команды датчиком
+            
+            return True
+            
+        except Exception as e:
+            print(f" [CMD=106] Ошибка записи параметра {param_code:02X}h: {e}")
+            return False
+    
+    def save_riftek_parameters_to_flash(self, sensor_address: int) -> bool:
+        """
+        Сохранение параметров в FLASH память датчика (команда 04h с константой 0xAA)
+        
+        Args:
+            sensor_address: Адрес датчика (1-4)
+            
+        Returns:
+            True если команда отправлена успешно
+        """
+        try:
+            if not self.sensors or not self.sensors.ser:
+                return False
+            
+            # Формат команды сохранения в FLASH (04h):
+            # Байт 0: 0|ADR (адрес датчика)
+            # Байт 1: 1|000|COD (код запроса 04h = 0x84)
+            # Байт 2: 1|SB|CNT|MSG[0] lo (младшая тетрада константы 0xAA = 0xA)
+            # Байт 3: 1|SB|CNT|MSG[0] hi (старшая тетрада константы 0xAA = 0xA)
+            
+            command = bytes([
+                sensor_address,  # Байт 0: адрес датчика
+                0x84,  # Байт 1: код запроса 04h (0x84 = 1|000|0100)
+                0x8A,  # Байт 2: младшая тетрада 0xAA (0xA = 0x80 | 0x0A)
+                0x8A,  # Байт 3: старшая тетрада 0xAA (0xA = 0x80 | 0x0A)
+            ])
+            
+            # Отправляем команду
+            self.sensors.ser.write(command)
+            time.sleep(0.1)  # Задержка для сохранения в FLASH (может занять время)
+            
+            return True
+            
+        except Exception as e:
+            print(f" [CMD=106] Ошибка сохранения в FLASH: {e}")
+            return False
 
     def read_recipe_flange_diameter(self) -> float:
         """Чтение рецепта диаметра фланца из регистров 40388, 40389"""
@@ -1935,6 +2205,26 @@ class LaserGeometrySystem:
     def read_bottom_thickness_offset_coeff(self) -> float:
         """Коэффициент смещения толщины дна (40508-40509)"""
         return self._read_offset_coeff(508)
+    
+    def read_upper_wall_extrapolation_coeff(self) -> float:
+        """Коэффициент экстраполяции толщины верхней стенки (40511-40512)"""
+        return self._read_offset_coeff(510)  # 40511 - 40000 = 511
+    
+    def read_bottom_wall_extrapolation_coeff(self) -> float:
+        """Коэффициент экстраполяции толщины нижней стенки (40513-40514)"""
+        return self._read_offset_coeff(512)  # 40513 - 40000 = 513
+    
+    def read_body_diameter_extrapolation_coeff(self) -> float:
+        """Коэффициент экстраполяции диаметра корпуса (40515-40516)"""
+        return self._read_offset_coeff(514)  # 40515 - 40000 = 515
+    
+    def read_flange_diameter_extrapolation_coeff(self) -> float:
+        """Коэффициент экстраполяции диаметра фланца (40517-40518)"""
+        return self._read_offset_coeff(516)  # 40517 - 40000 = 517
+    
+    def read_bottom_thickness_extrapolation_coeff(self) -> float:
+        """Коэффициент экстраполяции толщины дна (40519-40520)"""
+        return self._read_offset_coeff(518)  # 40519 - 40000 = 519
 
     def _read_offset_coeff(self, base_index: int) -> float:
         """Общий метод чтения коэффициента смещения"""
@@ -2948,7 +3238,8 @@ class LaserGeometrySystem:
         """Сброс команды в регистр 40001 в 0"""
         try:
             if self.modbus_server and self.modbus_server.slave_context:
-                self.modbus_server.slave_context.setValues(3, 1, [0])  # 40001 = 0
+                # 40001 соответствует индексу 0 в ModbusSequentialDataBlock
+                self.modbus_server.slave_context.setValues(3, 0, [0])  # 40001 = 0
                 print(" Команда сброшена в 0")
         except Exception as e:
             print(f" Ошибка сброса команды: {e}")
@@ -3127,6 +3418,33 @@ class LaserGeometrySystem:
             print(f" Ошибка чтения расстояния датчика 3 до центра: {e}")
         return None
     
+    def apply_extrapolation_to_buffer(self, buffer: list, extrapolation_coeff: float) -> list:
+        """
+        Применение экстраполяции к буферу измерений
+        
+        Формула: экстраполированное_значение = среднее + коэффициент * (измеренное - среднее)
+        
+        Args:
+            buffer: Список измеренных значений
+            extrapolation_coeff: Коэффициент экстраполяции
+            
+        Returns:
+            Список экстраполированных значений
+        """
+        if not buffer or len(buffer) == 0:
+            return buffer
+        
+        # Вычисляем среднее из исходного буфера
+        avg_value = sum(buffer) / len(buffer)
+        
+        # Применяем экстраполяцию к каждому значению
+        extrapolated_buffer = []
+        for value in buffer:
+            extrapolated_value = avg_value + extrapolation_coeff * (value - avg_value)
+            extrapolated_buffer.append(extrapolated_value)
+        
+        return extrapolated_buffer
+    
     def process_wall_measurement_results(self):
         """Обработка результатов измерения стенки при переходе 10→11"""
         try:
@@ -3134,10 +3452,20 @@ class LaserGeometrySystem:
                 print(" Ошибка: нет данных измерений для обработки")
                 return
             
-            # Вычисляем статистику
-            max_thickness = max(self.wall_thickness_buffer)
-            min_thickness = min(self.wall_thickness_buffer)
-            avg_thickness = sum(self.wall_thickness_buffer) / len(self.wall_thickness_buffer)
+            # Читаем коэффициент экстраполяции для верхней стенки
+            extrapolation_coeff = self.read_upper_wall_extrapolation_coeff()
+            
+            # Применяем экстраполяцию к буферу
+            if abs(extrapolation_coeff) > 0.0001:  # Применяем только если коэффициент не равен нулю
+                extrapolated_buffer = self.apply_extrapolation_to_buffer(self.wall_thickness_buffer, extrapolation_coeff)
+                print(f" [ЭКСТРАПОЛЯЦИЯ] Применен коэффициент {extrapolation_coeff:.6f} к толщине верхней стенки")
+            else:
+                extrapolated_buffer = self.wall_thickness_buffer
+            
+            # Вычисляем статистику из экстраполированных значений
+            max_thickness = max(extrapolated_buffer)
+            min_thickness = min(extrapolated_buffer)
+            avg_thickness = sum(extrapolated_buffer) / len(extrapolated_buffer)
             
             print(f" Результаты измерения верхней стенки:")
             print(f"   Измерений: {len(self.wall_thickness_buffer)}")
@@ -3173,7 +3501,7 @@ class LaserGeometrySystem:
         """Обработка результатов измерения фланца при переходе 11→12"""
         try:
             if (len(self.body_diameter_buffer) == 0 or len(self.flange_diameter_buffer) == 0 or
-                len(self.flange_thickness_buffer) == 0 or len(self.bottom_thickness_buffer) == 0):
+                len(self.bottom_thickness_buffer) == 0):
                 print(" Ошибка: нет данных измерений фланца для обработки")
                 return
             
@@ -3238,12 +3566,6 @@ class LaserGeometrySystem:
             else:
                 print(f"   БУФЕР ПУСТ!")
             
-            print(f"\n [БУФЕР ТОЛЩИНА ФЛАНЦА] Размер: {len(self.flange_thickness_buffer)}")
-            if len(self.flange_thickness_buffer) > 0:
-                print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.flange_thickness_buffer]}")
-            else:
-                print(f"   БУФЕР ПУСТ!")
-            
             print(f"\n{'='*80}\n")
             
             # Вычисляем статистику для диаметра корпуса
@@ -3253,6 +3575,13 @@ class LaserGeometrySystem:
             if len(valid_body_diameters) == 0:
                 print(" ОШИБКА: Нет валидных значений диаметра корпуса!")
                 return
+            
+            # Применяем экстраполяцию к диаметру корпуса
+            body_extrapolation_coeff = self.read_body_diameter_extrapolation_coeff()
+            if abs(body_extrapolation_coeff) > 0.0001:
+                valid_body_diameters = self.apply_extrapolation_to_buffer(valid_body_diameters, body_extrapolation_coeff)
+                print(f" [ЭКСТРАПОЛЯЦИЯ] Применен коэффициент {body_extrapolation_coeff:.6f} к диаметру корпуса")
+            
             max_body_diameter = max(valid_body_diameters)
             min_body_diameter = min(valid_body_diameters)
             avg_body_diameter = sum(valid_body_diameters) / len(valid_body_diameters)
@@ -3264,32 +3593,42 @@ class LaserGeometrySystem:
             if len(valid_flange_diameters) == 0:
                 print(" ОШИБКА: Нет валидных значений диаметра фланца!")
                 return
+            
+            # Применяем экстраполяцию к диаметру фланца
+            flange_extrapolation_coeff = self.read_flange_diameter_extrapolation_coeff()
+            if abs(flange_extrapolation_coeff) > 0.0001:
+                valid_flange_diameters = self.apply_extrapolation_to_buffer(valid_flange_diameters, flange_extrapolation_coeff)
+                print(f" [ЭКСТРАПОЛЯЦИЯ] Применен коэффициент {flange_extrapolation_coeff:.6f} к диаметру фланца")
+            
             max_flange_diameter = max(valid_flange_diameters)
             min_flange_diameter = min(valid_flange_diameters)
             avg_flange_diameter = sum(valid_flange_diameters) / len(valid_flange_diameters)
             
-            # Вычисляем статистику для толщины фланца
-            max_flange_thickness = max(self.flange_thickness_buffer)
-            min_flange_thickness = min(self.flange_thickness_buffer)
-            avg_flange_thickness = sum(self.flange_thickness_buffer) / len(self.flange_thickness_buffer)
+            # Толщина фланца теперь передаётся с ПК, не рассчитывается здесь
             
             # Вычисляем статистику для толщины дна
-            max_bottom_thickness = max(self.bottom_thickness_buffer)
-            min_bottom_thickness = min(self.bottom_thickness_buffer)
-            avg_bottom_thickness = sum(self.bottom_thickness_buffer) / len(self.bottom_thickness_buffer)
+            # Применяем экстраполяцию к толщине дна
+            bottom_extrapolation_coeff = self.read_bottom_thickness_extrapolation_coeff()
+            if abs(bottom_extrapolation_coeff) > 0.0001:
+                extrapolated_bottom_thickness = self.apply_extrapolation_to_buffer(self.bottom_thickness_buffer, bottom_extrapolation_coeff)
+                print(f" [ЭКСТРАПОЛЯЦИЯ] Применен коэффициент {bottom_extrapolation_coeff:.6f} к толщине дна")
+            else:
+                extrapolated_bottom_thickness = self.bottom_thickness_buffer
+            
+            max_bottom_thickness = max(extrapolated_bottom_thickness)
+            min_bottom_thickness = min(extrapolated_bottom_thickness)
+            avg_bottom_thickness = sum(extrapolated_bottom_thickness) / len(extrapolated_bottom_thickness)
             
             print(f" Результаты измерения фланца:")
             print(f"   Измерений: {len(self.body_diameter_buffer)}")
             print(f"   Диаметр корпуса: макс={max_body_diameter:.3f}мм, сред={avg_body_diameter:.3f}мм, мин={min_body_diameter:.3f}мм")
             print(f"   Диаметр фланца: макс={max_flange_diameter:.3f}мм, сред={avg_flange_diameter:.3f}мм, мин={min_flange_diameter:.3f}мм")
-            print(f"   Толщина фланца: макс={max_flange_thickness:.3f}мм, сред={avg_flange_thickness:.3f}мм, мин={min_flange_thickness:.3f}мм")
             print(f"   Толщина дна: макс={max_bottom_thickness:.3f}мм, сред={avg_bottom_thickness:.3f}мм, мин={min_bottom_thickness:.3f}мм")
             
             # Записываем результаты в регистры
             self.write_flange_measurement_results(
                 max_body_diameter, avg_body_diameter, min_body_diameter,
                 max_flange_diameter, avg_flange_diameter, min_flange_diameter,
-                max_flange_thickness, avg_flange_thickness, min_flange_thickness,
                 max_bottom_thickness, avg_bottom_thickness, min_bottom_thickness
             )
             
@@ -3299,7 +3638,6 @@ class LaserGeometrySystem:
     def write_flange_measurement_results(self, 
                                        max_body_diameter: float, avg_body_diameter: float, min_body_diameter: float,
                                        max_flange_diameter: float, avg_flange_diameter: float, min_flange_diameter: float,
-                                       max_flange_thickness: float, avg_flange_thickness: float, min_flange_thickness: float,
                                        max_bottom_thickness: float, avg_bottom_thickness: float, min_bottom_thickness: float):
         """Запись результатов измерения фланца в регистры"""
         try:
@@ -3314,10 +3652,7 @@ class LaserGeometrySystem:
                 self.write_stream_result_to_input_registers(avg_flange_diameter, 30052) # Среднее
                 self.write_stream_result_to_input_registers(min_flange_diameter, 30056) # Минимальное
                 
-                # Толщина фланца → 30034-30039
-                self.write_stream_result_to_input_registers(max_flange_thickness, 30034) # Максимальное
-                self.write_stream_result_to_input_registers(avg_flange_thickness, 30036) # Среднее
-                self.write_stream_result_to_input_registers(min_flange_thickness, 30038) # Минимальное
+                # Толщина фланца теперь передаётся с ПК, не записывается здесь
                 
                 # Толщина дна → 30028-30033
                 self.write_stream_result_to_input_registers(max_bottom_thickness, 30028) # Максимальное
@@ -3336,10 +3671,20 @@ class LaserGeometrySystem:
                 print(" Ошибка: нет данных измерений нижней стенки для обработки")
                 return
             
-            # Вычисляем статистику для толщины нижней стенки
-            max_bottom_wall_thickness = max(self.bottom_wall_thickness_buffer)
-            min_bottom_wall_thickness = min(self.bottom_wall_thickness_buffer)
-            avg_bottom_wall_thickness = sum(self.bottom_wall_thickness_buffer) / len(self.bottom_wall_thickness_buffer)
+            # Читаем коэффициент экстраполяции для нижней стенки
+            extrapolation_coeff = self.read_bottom_wall_extrapolation_coeff()
+            
+            # Применяем экстраполяцию к буферу
+            if abs(extrapolation_coeff) > 0.0001:  # Применяем только если коэффициент не равен нулю
+                extrapolated_buffer = self.apply_extrapolation_to_buffer(self.bottom_wall_thickness_buffer, extrapolation_coeff)
+                print(f" [ЭКСТРАПОЛЯЦИЯ] Применен коэффициент {extrapolation_coeff:.6f} к толщине нижней стенки")
+            else:
+                extrapolated_buffer = self.bottom_wall_thickness_buffer
+            
+            # Вычисляем статистику из экстраполированных значений
+            max_bottom_wall_thickness = max(extrapolated_buffer)
+            min_bottom_wall_thickness = min(extrapolated_buffer)
+            avg_bottom_wall_thickness = sum(extrapolated_buffer) / len(extrapolated_buffer)
             
             print(f" Результаты измерения нижней стенки:")
             print(f"   Измерений: {len(self.bottom_wall_thickness_buffer)}")
@@ -3511,9 +3856,7 @@ class LaserGeometrySystem:
                             flange_diameter = (distance_to_center_flange - avg_sensor3) * 2 + flange_diameter_offset
                         self.flange_diameter_buffer.append(flange_diameter)
                         
-                        # 3) Толщина фланца (Датчики 1,3)
-                        flange_thickness = avg_sensor1 - avg_sensor3 + distance_1_3
-                        self.flange_thickness_buffer.append(flange_thickness)
+                        # 3) Толщина фланца - теперь передаётся с ПК, не рассчитывается здесь
                         
                         # 4) Толщина дна (Датчик 4)
                         bottom_thickness = distance_sensor4 - avg_sensor4 + bottom_thickness_offset
@@ -3523,7 +3866,7 @@ class LaserGeometrySystem:
                         if len(self.body_diameter_buffer) % 100 == 0:
                             print(f" [CMD=12] Собрано: {len(self.body_diameter_buffer)} измерений")
                             print(f"   Диаметр корпуса={body_diameter:.3f}мм, Диаметр фланца={flange_diameter:.3f}мм")
-                            print(f"   Толщина фланца={flange_thickness:.3f}мм, Толщина дна={bottom_thickness:.3f}мм")
+                            print(f"   Толщина дна={bottom_thickness:.3f}мм")
                     else:
                         print(" Ошибка: не удалось прочитать калиброванные значения")
                     
@@ -3824,6 +4167,20 @@ class LaserGeometrySystem:
                     return height
         except Exception as e:
             print(f" Ошибка чтения регистров 40057-40058: {e}")
+        return None
+    
+    def read_measured_flange_thickness(self) -> float:
+        """Чтение регистров 40059-40060 (измеренная толщина фланца)"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                values = self.modbus_server.slave_context.getValues(3, 59, 2)  # 40059-40060
+                if values and len(values) == 2:
+                    high_word = int(values[0])  # 40059 - старший
+                    low_word = int(values[1])   # 40060 - младший
+                    thickness = self.doubleword_to_float(low_word, high_word)
+                    return thickness
+        except Exception as e:
+            print(f" Ошибка чтения регистров 40059-40060: {e}")
         return None
     
     def write_height_measurement_results(self, max_val: float, avg_val: float, min_val: float):
