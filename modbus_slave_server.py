@@ -11,6 +11,7 @@ import time
 import threading
 import logging
 import struct
+import socket
 try:
     # Для pymodbus 3.5.4
     from pymodbus.server import StartTcpServer
@@ -449,6 +450,77 @@ class ModbusSlaveServer:
             
             # 30104: Количество негодных изделий за смену
             103: 0,   # Негодные изделия
+
+            #30201: Условно-негодная Высота 
+            200: 0,  
+
+            #30202: Условно-негодная Толщина стенки вверху 
+            201: 0,                                       
+
+            #30203: Условно-негодная Толщина фланца 
+            202: 0,                                
+
+            #30204: Условно-негодная Толщина стенки стенки внизу (больше нормы)
+            203: 0,
+
+            #30205: Условно-негодная Толщина стенки стенки внизу (меньше нормы)
+            204: 0,              
+
+            #30206: Условно-негодная толщина дна  (меньше нормы)
+            205: 0,
+
+            #30207: Условно-негодная толщина дна  (больше нормы)
+            206: 0,
+
+            #30208: Условно-негодный диаметр фланца 
+            207: 0,
+
+            #30209: Условно-негодный диаметр корпуса 
+            208: 0,
+
+            #30210: Негодная Высота 
+            209: 0,  
+
+            #30211: Негодная Толщина стенки вверху 
+            210: 0,                                       
+
+            #30212: Негодная Толщина фланца 
+            211: 0,                                
+
+            #30213: Негодная Толщина стенки стенки внизу (меньше нормы)
+            212: 0,
+
+            #30214: Негодная Толщина стенки стенки внизу (больше нормы)
+            213: 0,              
+
+            #30215: Негодная толщина дна  (меньше нормы)
+            214: 0,
+
+            #30216: Негодная толщина дна  (больше нормы)
+            215: 0,
+
+            #30217: Негодный диаметр фланца 
+            216: 0,
+
+            #30218: Негодный диаметр корпуса 
+            217: 0,
+
+            #30219: Негодная Высота (больше нормы)
+            218: 0,
+
+            #30220: Негодная Толщина стенки вверху (больше нормы)
+            219: 0,
+
+            #30221: Негодная Толщина фланца (больше нормы)
+            220: 0,
+
+            #30222: Негодный диаметр фланца (больше нормы)
+            221: 0,
+
+            #30223: Негодный диаметр корпуса (больше нормы)
+            222: 0,
+
+
         }
         
         # Создание Modbus datastore
@@ -742,19 +814,87 @@ class ModbusSlaveServer:
             if self.enable_gui:
                 messagebox.showerror("Ошибка", f"Ошибка запуска сервера: {e}")
             
+    def _wait_for_ip_address(self, ip_address, max_retries=30, retry_delay=1):
+        """Ожидание готовности IP адреса"""
+        for attempt in range(max_retries):
+            try:
+                # Пытаемся создать сокет и привязать его к IP адресу
+                test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                test_sock.bind((ip_address, 0))  # Порт 0 = любой свободный порт
+                test_sock.close()
+                return True
+            except (OSError, socket.error) as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    self.log_message(f"IP адрес {ip_address} не готов после {max_retries} попыток: {e}")
+                    return False
+        return False
+    
     def run_modbus_server(self, port, identity):
-        """Запуск Modbus сервера"""
-        try:
-            self.log_message(f"Запуск TCP сервера на 192.168.1.50:{port}")
-            # Для pymodbus 3.5.4 - упрощенный синтаксис
-            StartTcpServer(
-                context=self.server_context, 
-                identity=identity, 
-                address=("192.168.1.50", port)
-            )
-        except Exception as e:
-            self.log_message(f"Ошибка работы сервера: {e}")
-            print(f"Детальная ошибка: {e}")  # Для отладки
+        """Запуск Modbus сервера с retry логикой"""
+        ip_address = "192.168.1.50"
+        max_retries = 10
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # Проверяем готовность IP адреса перед запуском
+                if not self._wait_for_ip_address(ip_address, max_retries=5, retry_delay=0.5):
+                    if attempt < max_retries - 1:
+                        self.log_message(f"Попытка {attempt + 1}/{max_retries}: IP адрес {ip_address} не готов, повтор через {retry_delay}с...")
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        self.log_message(f"КРИТИЧЕСКАЯ ОШИБКА: IP адрес {ip_address} не готов после всех попыток!")
+                        return
+                
+                self.log_message(f"Запуск TCP сервера на {ip_address}:{port} (попытка {attempt + 1}/{max_retries})")
+                
+                # Для pymodbus 3.5.4 - упрощенный синтаксис
+                StartTcpServer(
+                    context=self.server_context, 
+                    identity=identity, 
+                    address=(ip_address, port)
+                )
+                # Если дошли сюда, сервер запустился успешно
+                return
+                
+            except OSError as e:
+                error_msg = str(e).lower()
+                if "address already in use" in error_msg or "port" in error_msg:
+                    self.log_message(f"Порт {port} занят, повтор через {retry_delay}с... (попытка {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        self.log_message(f"КРИТИЧЕСКАЯ ОШИБКА: Порт {port} занят после всех попыток!")
+                        return
+                elif "cannot assign requested address" in error_msg or "bind" in error_msg:
+                    self.log_message(f"IP адрес {ip_address} не готов, повтор через {retry_delay}с... (попытка {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        self.log_message(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось привязаться к {ip_address}:{port} после всех попыток!")
+                        return
+                else:
+                    self.log_message(f"Ошибка работы сервера: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        self.log_message(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
+                        return
+            except Exception as e:
+                self.log_message(f"Ошибка работы сервера: {e}")
+                print(f"Детальная ошибка: {e}")  # Для отладки
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    return
             
     def stop_modbus_server(self):
         """Остановка Modbus сервера"""

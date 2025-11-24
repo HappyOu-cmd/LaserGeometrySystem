@@ -92,6 +92,28 @@ class ModbusDatabase:
                 ON measurement_history(timestamp)
             ''')
             
+            # Создаем таблицу для хранения средних значений измерений текущей смены
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS quality_measurements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shift_number INTEGER NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    height_avg REAL,
+                    upper_wall_avg REAL,
+                    body_diameter_avg REAL,
+                    flange_diameter_avg REAL,
+                    bottom_wall_avg REAL,
+                    flange_thickness_avg REAL,
+                    bottom_avg REAL
+                )
+            ''')
+            
+            # Создаем индекс для быстрого поиска по смене
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_quality_shift_number 
+                ON quality_measurements(shift_number)
+            ''')
+            
             # Выполняем миграцию для добавления новых полей
             self._migrate_database(cursor)
             
@@ -698,6 +720,93 @@ class ModbusDatabase:
                 'conditionally_good': row[2] or 0,
                 'bad': row[3] or 0
             }
+    
+    def save_quality_measurement(self, shift_number: int, measurement_data: Dict):
+        """
+        Сохранение средних значений измерения в таблицу quality_measurements
+        
+        Args:
+            shift_number: Номер смены
+            measurement_data: Словарь с ключами height_avg, upper_wall_avg, и т.д.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO quality_measurements (
+                    shift_number,
+                    height_avg,
+                    upper_wall_avg,
+                    body_diameter_avg,
+                    flange_diameter_avg,
+                    bottom_wall_avg,
+                    flange_thickness_avg,
+                    bottom_avg
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                shift_number,
+                measurement_data.get('height_avg'),
+                measurement_data.get('upper_wall_avg'),
+                measurement_data.get('body_diameter_avg'),
+                measurement_data.get('flange_diameter_avg'),
+                measurement_data.get('bottom_wall_avg'),
+                measurement_data.get('flange_thickness_avg'),
+                measurement_data.get('bottom_avg')
+            ))
+            conn.commit()
+    
+    def get_shift_measurements(self, shift_number: int) -> List[Dict]:
+        """
+        Получение всех измерений для смены
+        
+        Args:
+            shift_number: Номер смены
+            
+        Returns:
+            Список словарей с измерениями
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT 
+                    id,
+                    height_avg,
+                    upper_wall_avg,
+                    body_diameter_avg,
+                    flange_diameter_avg,
+                    bottom_wall_avg,
+                    flange_thickness_avg,
+                    bottom_avg
+                FROM quality_measurements
+                WHERE shift_number = ?
+                ORDER BY id
+            ''', (shift_number,))
+            
+            rows = cursor.fetchall()
+            return [{
+                'id': row[0],
+                'height_avg': row[1],
+                'upper_wall_avg': row[2],
+                'body_diameter_avg': row[3],
+                'flange_diameter_avg': row[4],
+                'bottom_wall_avg': row[5],
+                'flange_thickness_avg': row[6],
+                'bottom_avg': row[7]
+            } for row in rows]
+    
+    def clear_shift_measurements(self, shift_number: int):
+        """
+        Очистка измерений для смены
+        
+        Args:
+            shift_number: Номер смены
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                DELETE FROM quality_measurements
+                WHERE shift_number = ?
+            ''', (shift_number,))
+            conn.commit()
 
 
 def main():

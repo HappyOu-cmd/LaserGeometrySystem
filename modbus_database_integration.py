@@ -63,9 +63,10 @@ class ModbusDatabaseIntegration:
         
         # Одиночные регистры для мониторинга
         # Сохраняем только: номер смены (40100) и номер изделия (40101)
+        # ВАЖНО: ModbusSequentialDataBlock 1-индексный (40001 -> индекс 0), поэтому 40100 -> индекс 99
         self.holding_registers_to_monitor = [
-            (100, "Номер смены"),      # 40100
-            (101, "Номер изделия"),    # 40101
+            (99, "Номер смены"),      # 40100
+            (100, "Номер изделия"),    # 40101
         ]
         
         self.input_registers_to_monitor = [
@@ -105,6 +106,31 @@ class ModbusDatabaseIntegration:
     def _monitor_registers(self, interval: float):
         """Мониторинг изменений регистров"""
         previous_values = {}
+        
+        # Инициализируем previous_values текущими значениями при первом запуске
+        # чтобы первое изменение точно сохранилось
+        try:
+            # Инициализируем одиночные Holding Registers
+            for addr, description in self.holding_registers_to_monitor:
+                try:
+                    values = self.modbus_server.slave_context.getValues(3, addr, 1)
+                    if values:
+                        key = f"holding_{addr}"
+                        previous_values[key] = int(values[0])
+                except Exception:
+                    pass
+            
+            # Инициализируем Input Registers
+            for addr, description in self.input_registers_to_monitor:
+                try:
+                    values = self.modbus_server.slave_context.getValues(4, addr, 1)
+                    if values:
+                        key = f"input_{addr}"
+                        previous_values[key] = int(values[0])
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Ошибка инициализации previous_values: {e}")
         
         while self.is_monitoring:
             try:
@@ -232,8 +258,27 @@ class ModbusDatabaseIntegration:
                 if address == 40057 or address == 40058 or address == 40059 or address == 40060:
                     continue  # Пропускаем регистр измеренной высоты - он записывается только ПЛК
                 
-                # Проверяем, является ли это DoubleWord регистром по наличию float_value или is_float_display
-                is_doubleword = reg.get('is_float_display', 0) == 1 or reg.get('float_value') is not None
+                # Специальная обработка одиночного регистра 40099 (перед номером смены)
+                if address in (40100, 40101, 40099):
+                    try:
+                        idx = address - 40000 # ModbusSequentialDataBlock 1-индексный
+                        value = int(reg.get('value_low') or 0)
+                        self.modbus_server.slave_context.setValues(3, idx, [value])
+                        loaded_addresses.add(address)
+                        print(f"Загружен Holding Register {address} (спец. случай): {value}")
+                    except Exception as exc:
+                        print(f"Ошибка загрузки Holding Register {address} (спец. случай): {exc}")
+                    continue
+                
+                
+                # Проверяем, является ли это DoubleWord регистром:
+                # - либо он явно относится к списку doubleword-пар
+                # - либо сохранён с флагами отображения float (is_float_display / float_pair_address)
+                is_doubleword = (
+                    reg.get('is_float_display', 0) == 1
+                    or reg.get('float_pair_address') is not None
+                    or any(pair[0] == address for pair in self.holding_doubleword_pairs)
+                )
                 
                 if is_doubleword and reg.get('value_high') is not None:
                     # DoubleWord регистр - загружаем оба слова
@@ -265,6 +310,7 @@ class ModbusDatabaseIntegration:
                     print(f"Загружен Holding DoubleWord {address}-{address+1}: high={value_high}, low={value_low}, float={reg.get('float_value', 'N/A')}")
                 else:
                     # Обычный регистр
+                    addr = address - 40001  # Конвертируем Modbus-адрес в индекс pymodbus
                     self.modbus_server.slave_context.setValues(3, addr, [value_low])
                     loaded_addresses.add(address)
                     print(f"Загружен Holding Register {address}: {value_low}")

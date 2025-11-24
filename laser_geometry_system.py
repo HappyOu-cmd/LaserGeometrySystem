@@ -11,6 +11,9 @@ import os
 import ctypes
 import math
 import contextlib
+import fcntl
+import sys
+from datetime import datetime
 from queue import Queue, Empty
 from enum import Enum
 from typing import Optional, Tuple, List
@@ -35,6 +38,14 @@ except ImportError:
     from main import HighSpeedRiftekSensor, apply_system_optimizations
 from modbus_slave_server import ModbusSlaveServer
 from modbus_database_integration import ModbusDatabaseIntegration
+
+try:
+    from docx import Document
+    from docx.shared import Pt
+    from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
 
 
 def apply_laser_system_optimizations():
@@ -163,6 +174,11 @@ class LaserGeometrySystem:
         self.sensors = None
         self.modbus_server = None
         self.db_integration = None
+        self.data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        try:
+            os.makedirs(self.data_dir, exist_ok=True)
+        except Exception as e:
+            print(f" [REPORT] Не удалось создать папку для отчётов {self.data_dir}: {e}")
         
         # Состояние системы
         self.current_state = SystemState.IDLE
@@ -244,6 +260,7 @@ class LaserGeometrySystem:
         
         # Отслеживание смены для сброса счётчиков
         self.current_shift_number = 1  # Текущая смена
+        self.shift_initialized = False  # Флаг, чтобы не сбрасывать при первом запуске
         
         # Мониторинг частоты опроса
         self.frequency_counter = 0
@@ -347,10 +364,24 @@ class LaserGeometrySystem:
         # Загружаем сохраненные регистры из базы данных
         self.db_integration.load_all_registers_from_db()
         
+        # После загрузки БД повторно синхронизируем номер смены,
+        # чтобы избежать ложного срабатывания детектора смены
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                current_shift = self.modbus_server.slave_context.getValues(3, 99, 1)[0]
+                self.last_shift_number = int(current_shift)
+                print(f" [SHIFT] Смены синхронизированы после загрузки БД: {self.last_shift_number}")
+        except Exception as e:
+            print(f" [SHIFT] Ошибка повторной синхронизации смены: {e}")
+        
         # Запускаем мониторинг изменений регистров
         self.db_integration.start_monitoring(interval=1.0)
         print("OK Интеграция с базой данных запущена")
         
+        # Флаг работы системы должен быть поднят ДО запуска вспомогательных потоков,
+        # иначе поток чтения датчиков завершится, не войдя в цикл
+        self.is_running = True
+
         # Запуск потока чтения датчиков для доставки данных через очередь
         if self.sensors and not self.test_mode and not self.sensor_reading_active:
             self.sensor_reading_active = True
@@ -359,7 +390,6 @@ class LaserGeometrySystem:
             print("OK Поток чтения датчиков запущен")
         
         # Запуск основного цикла в отдельном потоке
-        self.is_running = True
         main_thread = threading.Thread(target=self.main_loop, daemon=True)
         main_thread.start()
         print("OK Основной цикл запущен")
@@ -565,22 +595,8 @@ class LaserGeometrySystem:
                     self.handle_command(current_cmd)
                     self.previous_cmd = current_cmd
 
-                # Детектор смены: при изменении 40100 сбрасываем счётчики 30101-30104
-                try:
-                    if self.modbus_server and self.modbus_server.slave_context:
-                        current_shift = int(self.modbus_server.slave_context.getValues(3, 99, 1)[0])  # 40100
-                        if self.last_shift_number is None:
-                            self.last_shift_number = current_shift
-                        elif current_shift != self.last_shift_number:
-                            print(f" [SHIFT] Смена изменилась: {self.last_shift_number} → {current_shift}. Сбрасываем счётчики за смену...")
-                            # 30101..30104 → индексы 100..103 в Input регистрах
-                            self.modbus_server.slave_context.setValues(4, 100, [0])  # всего
-                            self.modbus_server.slave_context.setValues(4, 101, [0])  # годных
-                            self.modbus_server.slave_context.setValues(4, 102, [0])  # условно-негодных
-                            self.modbus_server.slave_context.setValues(4, 103, [0])  # негодных
-                            self.last_shift_number = current_shift
-                except Exception as e:
-                    print(f" [SHIFT] Ошибка проверки/сброса счётчиков при смене: {e}")
+                # Проверяем смену смены в основном цикле
+                self.check_shift_change()
                 
                 # Выполняем действия в зависимости от состояния
                 self.execute_state_actions()
@@ -589,7 +605,8 @@ class LaserGeometrySystem:
                 if self.current_state not in [SystemState.STREAM_QUAD, 
                                              SystemState.MEASURE_HEIGHT_PROCESS, SystemState.MEASURE_WALL_PROCESS, 
                                              SystemState.MEASURE_FLANGE_PROCESS, SystemState.MEASURE_BOTTOM_PROCESS,
-                                             SystemState.CALIBRATE_HEIGHT]:
+                                             SystemState.CALIBRATE_HEIGHT,SystemState.CALIBRATE_WALL,SystemState.CALIBRATE_FLANGE,
+                                             SystemState.CALIBRATE_FLANGE_DIAMETER,SystemState.CALIBRATE_BOTTOM]:
                     time.sleep(0.1)
                 elif self.current_state == SystemState.STREAM_QUAD:
                     # Микро-пауза в QUAD режиме для снижения нагрузки на CPU (5 мс)
@@ -1075,12 +1092,15 @@ class LaserGeometrySystem:
         except Exception as e:
             print(f" Ошибка увеличения номера изделия: {e}")
     
-    def evaluate_product_quality(self) -> str:
+    def evaluate_product_quality(self) -> dict:
         """
         Оценка качества изделия после завершения цикла измерения
         
         Returns:
-            "GOOD", "CONDITIONALLY_GOOD" или "BAD"
+            Словарь с ключами:
+            - 'result': "GOOD", "CONDITIONALLY_GOOD" или "BAD"
+            - 'param_details': Список словарей с информацией о каждом параметре
+                (name, status, measured, base, check_type)
         """
         try:
             if not self.modbus_server or not self.modbus_server.slave_context:
@@ -1287,6 +1307,41 @@ class LaserGeometrySystem:
                 else:
                     param_status = "GOOD"
                 
+                # Сохраняем информацию о параметре для статистики
+                # Сохраняем все проверенные значения с их статусами для правильного определения направления
+                checked_values = []
+                if param.get('single_value', False):
+                    # Для одного значения
+                    checked_values.append({
+                        'value': measured_values[0],
+                        'status': param_errors[0] if param_errors else 'GOOD',
+                        'index': 0
+                    })
+                else:
+                    # Для нескольких значений сохраняем только проверенные (по check_indices)
+                    value_names = ['МАКС', 'СРЕД', 'МИН']
+                    for i, idx in enumerate(check_indices):
+                        checked_values.append({
+                            'value': measured_values[idx],
+                            'status': param_errors[i] if i < len(param_errors) else 'GOOD',
+                            'index': idx,
+                            'name': value_names[idx]
+                        })
+                
+                param_info = {
+                    'name': param['name'],
+                    'status': param_status,
+                    'base': base_value,
+                    'check_type': param['check_type'],
+                    'cond_bad_error': cond_bad_error,
+                    'bad_error': bad_error,
+                    'positive_bad_error': positive_bad_error if param['check_type'] == 'two_sided' else None,
+                    'checked_values': checked_values
+                }
+                if 'param_details' not in measurement_data:
+                    measurement_data['param_details'] = []
+                measurement_data['param_details'].append(param_info)
+                
                 print(f" ИТОГ: {param_status}")
                 measurement_data[f"{param['name']}_status"] = param_status
             
@@ -1306,16 +1361,30 @@ class LaserGeometrySystem:
             
             measurement_data['result'] = result
             
-            # Сохраняем в БД
-            # Отключено сохранение записей измерений в БД - сохраняем только указанные величины
-            # if self.modbus_server.db_integration:
-            #     self.modbus_server.db_integration.db.save_measurement_record(measurement_data)
+            # Сохраняем средние значения в БД для отчёта
+            if self.db_integration:
+                try:
+                    self.db_integration.db.save_quality_measurement(shift_number, {
+                        'height_avg': measurement_data.get('height_avg'),
+                        'upper_wall_avg': measurement_data.get('upper_wall_avg'),
+                        'body_diameter_avg': measurement_data.get('body_diameter_avg'),
+                        'flange_diameter_avg': measurement_data.get('flange_diameter_avg'),
+                        'bottom_wall_avg': measurement_data.get('bottom_wall_avg'),
+                        'flange_thickness_avg': measurement_data.get('flange_thickness_avg'),
+                        'bottom_avg': measurement_data.get('bottom_avg')
+                    })
+                except Exception as e:
+                    print(f" [CMD=16] Ошибка сохранения измерений в БД: {e}")
             
-            return result
+            # Возвращаем словарь с результатом и информацией о параметрах
+            return {
+                'result': result,
+                'param_details': measurement_data.get('param_details', [])
+            }
             
         except Exception as e:
             print(f" Ошибка оценки качества: {e}")
-            return "BAD"
+            return {'result': 'BAD', 'param_details': []}
     
     def check_single_value(self, measured: float, base: float, cond_bad_error: float, bad_error: float) -> str:
         """
@@ -1416,6 +1485,280 @@ class LaserGeometrySystem:
             print(f" Ошибка чтения float из регистров {reg_pair}: {e}")
             return 0.0
     
+    def read_input_register(self, register_number: int) -> int:
+        """
+        Чтение значения Input регистра по его адресу (30001+)
+        """
+        try:
+            if not self.modbus_server or not self.modbus_server.slave_context:
+                return 0
+            
+            index = register_number - 30001
+            if index < 0:
+                return 0
+            
+            value = self.modbus_server.slave_context.getValues(4, index, 1)[0]
+            return int(value)
+        except Exception as e:
+            print(f" Ошибка чтения Input регистра {register_number}: {e}")
+            return 0
+    
+    def generate_shift_report(self, shift_number: int):
+        """
+        Формирует DOCX отчёт по результатам смены
+        """
+        if not DOCX_AVAILABLE:
+            print(" [REPORT] Невозможно сформировать отчёт: не установлена библиотека python-docx")
+            return
+        
+        if not self.modbus_server or not self.modbus_server.slave_context:
+            print(" [REPORT] Modbus сервер не инициализирован, отчёт не создан")
+            return
+        
+        try:
+            timestamp = datetime.now()
+            formatted_time = timestamp.strftime("%d.%m.%Y %H:%M:%S")
+            filename = f"shift_{shift_number}_{timestamp.strftime('%Y%m%d_%H%M%S')}.docx"
+            filepath = os.path.join(self.data_dir, filename)
+            
+            # Счётчики изделий
+            total_measured = self.read_input_register(30101)
+            total_good = self.read_input_register(30102)
+            total_conditionally_good = self.read_input_register(30103)
+            total_bad = self.read_input_register(30104)
+            
+            # Карта параметров для таблиц
+            parameter_config = [
+                {
+                    'label': 'Высота',
+                    'cond_less': 30201,
+                    'cond_greater': None,
+                    'bad_less': 30210,
+                    'bad_greater': 30219
+                },
+                {
+                    'label': 'Толщина стенки вверх',
+                    'cond_less': 30202,
+                    'cond_greater': None,
+                    'bad_less': 30211,
+                    'bad_greater': 30220
+                },
+                {
+                    'label': 'Толщина стенки вниз',
+                    'cond_less': 30205,
+                    'cond_greater': 30204,
+                    'bad_less': 30213,
+                    'bad_greater': 30214
+                },
+                {
+                    'label': 'Диаметр корпуса',
+                    'cond_less': 30209,
+                    'cond_greater': None,
+                    'bad_less': 30218,
+                    'bad_greater': 30223
+                },
+                {
+                    'label': 'Толщина дна',
+                    'cond_less': 30206,
+                    'cond_greater': 30207,
+                    'bad_less': 30215,
+                    'bad_greater': 30216
+                },
+                {
+                    'label': 'Толщина фланца',
+                    'cond_less': 30203,
+                    'cond_greater': None,
+                    'bad_less': 30212,
+                    'bad_greater': 30221
+                },
+                {
+                    'label': 'Диаметр фланца',
+                    'cond_less': 30208,
+                    'cond_greater': None,
+                    'bad_less': 30217,
+                    'bad_greater': 30222
+                },
+            ]
+            
+            def get_reg_value(reg_number: Optional[int]) -> int:
+                if reg_number is None:
+                    return 0
+                return self.read_input_register(reg_number)
+            
+            conditional_rows = []
+            bad_rows = []
+            for param in parameter_config:
+                conditional_rows.append({
+                    'label': param['label'],
+                    'less': get_reg_value(param['cond_less']),
+                    'greater': get_reg_value(param['cond_greater'])
+                })
+                bad_rows.append({
+                    'label': param['label'],
+                    'less': get_reg_value(param['bad_less']),
+                    'greater': get_reg_value(param['bad_greater'])
+                })
+            
+            # Создаём документ
+            document = Document()
+            style = document.styles['Normal']
+            style.font.name = 'Arial'
+            style.font.size = Pt(11)
+            
+            title = document.add_paragraph("Протокол измерений")
+            title.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            title.runs[0].bold = True
+            title.runs[0].font.size = Pt(16)
+            
+            document.add_paragraph("")  # Отступ
+            
+            header_table = document.add_table(rows=2, cols=4)
+            header_table.style = 'Table Grid'
+            header_cells = header_table.rows[0].cells
+            header_cells[0].text = "Тип"
+            header_cells[1].text = ""
+            header_cells[2].text = "Изделие"
+            header_cells[3].text = ""
+            
+            row2 = header_table.rows[1].cells
+            row2[0].text = "Смена"
+            row2[1].text = str(shift_number)
+            row2[2].text = "Дата"
+            row2[3].text = formatted_time
+            
+            document.add_paragraph("")
+            
+            summary_table = document.add_table(rows=2, cols=4)
+            summary_table.style = 'Table Grid'
+            summary_table.rows[0].cells[0].text = "Измерено, шт."
+            summary_table.rows[0].cells[1].text = "Годные, шт."
+            summary_table.rows[0].cells[2].text = "Условно годные, шт."
+            summary_table.rows[0].cells[3].text = "Брак, шт."
+            
+            summary_table.rows[1].cells[0].text = str(total_measured)
+            summary_table.rows[1].cells[1].text = str(total_good)
+            summary_table.rows[1].cells[2].text = str(total_conditionally_good)
+            summary_table.rows[1].cells[3].text = str(total_bad)
+            
+            document.add_paragraph("")
+            
+            heading = document.add_paragraph("Сводные таблицы результатов измерений")
+            heading.runs[0].bold = True
+            
+            def add_parameter_table(title_text: str, rows: List[dict]):
+                document.add_paragraph("")
+                table = document.add_table(rows=len(rows) + 2, cols=3)
+                table.style = 'Table Grid'
+                
+                top_row = table.rows[0].cells
+                top_row[0].text = "Параметр"
+                top_row[1].text = title_text
+                top_row[1].merge(top_row[2])
+                
+                second_row = table.rows[1].cells
+                second_row[0].text = ""
+                second_row[1].text = "< нормы"
+                second_row[2].text = "> нормы"
+                
+                for idx, row in enumerate(rows, start=2):
+                    table.rows[idx].cells[0].text = row['label']
+                    table.rows[idx].cells[1].text = str(row['less'])
+                    table.rows[idx].cells[2].text = str(row['greater'])
+            
+            add_parameter_table("Условно годные, шт.", conditional_rows)
+            add_parameter_table("Забраковано, шт.", bad_rows)
+            
+            # Добавляем второй лист с таблицей измерений
+            document.add_page_break()
+            
+            # Заголовок второго листа
+            title2 = document.add_paragraph("Протокол измерений")
+            title2.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            title2.runs[0].bold = True
+            title2.runs[0].font.size = Pt(16)
+            
+            document.add_paragraph("")  # Отступ
+            
+            # Шапка второго листа (Смена и Дата)
+            header_table2 = document.add_table(rows=2, cols=4)
+            header_table2.style = 'Table Grid'
+            header_cells2 = header_table2.rows[0].cells
+            header_cells2[0].text = "Тип"
+            header_cells2[1].text = ""
+            header_cells2[2].text = "Изделие"
+            header_cells2[3].text = ""
+            
+            row2_2 = header_table2.rows[1].cells
+            row2_2[0].text = "Смена"
+            row2_2[1].text = str(shift_number)
+            row2_2[2].text = "Дата"
+            row2_2[3].text = formatted_time
+            
+            document.add_paragraph("")
+            
+            # Получаем измерения из БД
+            measurements = []
+            if self.db_integration:
+                try:
+                    measurements = self.db_integration.db.get_shift_measurements(shift_number)
+                except Exception as e:
+                    print(f" [REPORT] Ошибка получения измерений из БД: {e}")
+            
+            # Создаём таблицу измерений
+            if measurements:
+                # Заголовок таблицы
+                heading2 = document.add_paragraph("Сводные таблицы результатов измерений")
+                heading2.runs[0].bold = True
+                heading2.runs[0].italic = True
+                heading2.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                
+                document.add_paragraph("")
+                
+                # Таблица измерений
+                measurements_table = document.add_table(rows=len(measurements) + 1, cols=8)
+                measurements_table.style = 'Table Grid'
+                
+                # Заголовки столбцов
+                header_row = measurements_table.rows[0].cells
+                header_row[0].text = "№ п/п"
+                header_row[1].text = "Высота, мм"
+                header_row[2].text = "Толщина стенки вверху, мм среднее"
+                header_row[3].text = "Диаметр корпуса, мм среднее"
+                header_row[4].text = "Диаметр фланца, мм среднее"
+                header_row[5].text = "Толщина стенки внизу, мм среднее"
+                header_row[6].text = "Толщина фланца, мм"
+                header_row[7].text = "Толщина дна, мм среднее"
+                
+                # Выравнивание заголовков
+                for cell in header_row:
+                    for paragraph in cell.paragraphs:
+                        paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                        for run in paragraph.runs:
+                            run.bold = True
+                
+                # Заполняем данные
+                for idx, meas in enumerate(measurements, start=1):
+                    row = measurements_table.rows[idx].cells
+                    row[0].text = str(idx)
+                    row[1].text = f"{meas.get('height_avg', 0):.3f}" if meas.get('height_avg') is not None else "0.000"
+                    row[2].text = f"{meas.get('upper_wall_avg', 0):.3f}" if meas.get('upper_wall_avg') is not None else "0.000"
+                    row[3].text = f"{meas.get('body_diameter_avg', 0):.3f}" if meas.get('body_diameter_avg') is not None else "0.000"
+                    row[4].text = f"{meas.get('flange_diameter_avg', 0):.3f}" if meas.get('flange_diameter_avg') is not None else "0.000"
+                    row[5].text = f"{meas.get('bottom_wall_avg', 0):.3f}" if meas.get('bottom_wall_avg') is not None else "0.000"
+                    row[6].text = f"{meas.get('flange_thickness_avg', 0):.3f}" if meas.get('flange_thickness_avg') is not None else "0.000"
+                    row[7].text = f"{meas.get('bottom_avg', 0):.3f}" if meas.get('bottom_avg') is not None else "0.000"
+                    
+                    # Выравнивание: первый столбец по центру, остальные по центру
+                    row[0].paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                    for i in range(1, 8):
+                        row[i].paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            
+            document.save(filepath)
+            print(f" [REPORT] Сформирован отчёт по смене {shift_number}: {filepath}")
+        
+        except Exception as e:
+            print(f" [REPORT] Ошибка формирования отчёта: {e}")
+    
     def update_product_counters(self, result: str):
         """
         Обновление счётчиков изделий
@@ -1453,6 +1796,169 @@ class LaserGeometrySystem:
         except Exception as e:
             print(f" Ошибка обновления счётчиков: {e}")
     
+    def increment_parameter_statistics(self, quality_result: dict):
+        """
+        Инкрементация регистров статистики параметров
+        
+        Args:
+            quality_result: Словарь с ключами 'result' и 'param_details'
+                - result: "GOOD", "CONDITIONALLY_GOOD" или "BAD"
+                - param_details: Список словарей с информацией о параметрах
+        """
+        try:
+            if not self.modbus_server or not self.modbus_server.slave_context:
+                return
+            
+            result = quality_result.get('result', 'GOOD')
+            param_details = quality_result.get('param_details', [])
+            
+            # Если деталь годная - ничего не инкрементируем
+            if result == 'GOOD':
+                return
+            
+            # Маппинг параметров на регистры статистики
+            # Формат: (param_name, check_type) -> (условно_негодный_регистр, негодный_меньше_регистр, негодный_больше_регистр)
+            param_registers = {
+                ('height', 'one_sided'): (200, 209, 218),  # 30201, 30210, 30219
+                ('upper_wall', 'one_sided'): (201, 210, 219),  # 30202, 30211, 30220
+                ('flange_thickness', 'one_sided'): (202, 211, 220),  # 30203, 30212, 30221
+                ('body_diameter', 'one_sided'): (208, 217, 222),  # 30209, 30218, 30223
+                ('flange_diameter', 'one_sided'): (207, 216, 221),  # 30208, 30217, 30222
+                ('bottom_wall', 'two_sided'): {
+                    'cond_bad_greater': 203,  # 30204
+                    'cond_bad_less': 204,  # 30205
+                    'bad_less': 212,  # 30213
+                    'bad_greater': 213  # 30214
+                },
+                ('bottom', 'two_sided'): {
+                    'cond_bad_less': 205,  # 30206
+                    'cond_bad_greater': 206,  # 30207
+                    'bad_less': 214,  # 30215
+                    'bad_greater': 215  # 30216
+                }
+            }
+            
+            # Инкрементируем регистры для проблемных параметров
+            for param_info in param_details:
+                param_name = param_info['name']
+                param_status = param_info['status']
+                check_type = param_info['check_type']
+                base = param_info['base']
+                cond_bad_error = param_info.get('cond_bad_error', 0)
+                bad_error = param_info.get('bad_error', 0)
+                positive_bad_error = param_info.get('positive_bad_error')
+                checked_values = param_info.get('checked_values', [])
+                
+                # Пропускаем годные параметры
+                if param_status == 'GOOD':
+                    continue
+                
+                # Определяем ключ для поиска регистров
+                key = (param_name, check_type)
+                
+                if check_type == 'one_sided':
+                    # Для односторонних параметров
+                    if key in param_registers:
+                        cond_reg, bad_less_reg, bad_greater_reg = param_registers[key]
+                        
+                        # Отслеживаем направления отклонения для всех проверенных значений
+                        has_cond_bad = False
+                        has_bad_greater = False
+                        has_bad_less = False
+                        
+                        for checked in checked_values:
+                            value = checked['value']
+                            value_status = checked['status']
+                            
+                            if result == 'CONDITIONALLY_GOOD' and value_status == 'CONDITIONALLY_GOOD':
+                                has_cond_bad = True
+                            
+                            elif result == 'BAD' and value_status == 'BAD':
+                                # Определяем направление отклонения для негодного значения
+                                if value > base:
+                                    # Больше нормы
+                                    has_bad_greater = True
+                                elif value < base + bad_error:
+                                    # Меньше нормы (меньше негодной границы)
+                                    has_bad_less = True
+                        
+                        # Инкрементируем регистры
+                        if result == 'CONDITIONALLY_GOOD' and param_status == 'CONDITIONALLY_GOOD' and has_cond_bad:
+                            current = self.modbus_server.slave_context.getValues(4, cond_reg, 1)[0]
+                            self.modbus_server.slave_context.setValues(4, cond_reg, [current + 1])
+                            print(f" [СТАТИСТИКА] Инкрементирован регистр {30001 + cond_reg} ({param_name}, условно-негодный)")
+                        
+                        if result == 'BAD' and param_status == 'BAD':
+                            if has_bad_greater:
+                                current = self.modbus_server.slave_context.getValues(4, bad_greater_reg, 1)[0]
+                                self.modbus_server.slave_context.setValues(4, bad_greater_reg, [current + 1])
+                                print(f" [СТАТИСТИКА] Инкрементирован регистр {30001 + bad_greater_reg} ({param_name}, негодный, больше нормы)")
+                            if has_bad_less:
+                                current = self.modbus_server.slave_context.getValues(4, bad_less_reg, 1)[0]
+                                self.modbus_server.slave_context.setValues(4, bad_less_reg, [current + 1])
+                                print(f" [СТАТИСТИКА] Инкрементирован регистр {30001 + bad_less_reg} ({param_name}, негодный, меньше нормы)")
+                
+                elif check_type == 'two_sided':
+                    # Для двусторонних параметров
+                    if key in param_registers:
+                        regs = param_registers[key]
+                        
+                        # Отслеживаем направления отклонения для всех проверенных значений
+                        has_cond_bad_greater = False
+                        has_cond_bad_less = False
+                        has_bad_greater = False
+                        has_bad_less = False
+                        
+                        for checked in checked_values:
+                            value = checked['value']
+                            value_status = checked['status']
+                            
+                            if result == 'CONDITIONALLY_GOOD' and value_status == 'CONDITIONALLY_GOOD':
+                                # Определяем направление для условно-негодного значения
+                                if value > base:
+                                    has_cond_bad_greater = True
+                                elif value < base:
+                                    has_cond_bad_less = True
+                            
+                            elif result == 'BAD' and value_status == 'BAD':
+                                # Определяем направление для негодного значения
+                                if value > base + (positive_bad_error if positive_bad_error else 0):
+                                    # Больше верхней границы
+                                    has_bad_greater = True
+                                elif value < base + bad_error:
+                                    # Меньше нижней границы
+                                    has_bad_less = True
+                        
+                        # Инкрементируем регистры
+                        if result == 'CONDITIONALLY_GOOD' and param_status == 'CONDITIONALLY_GOOD':
+                            if has_cond_bad_greater:
+                                reg_idx = regs['cond_bad_greater']
+                                current = self.modbus_server.slave_context.getValues(4, reg_idx, 1)[0]
+                                self.modbus_server.slave_context.setValues(4, reg_idx, [current + 1])
+                                print(f" [СТАТИСТИКА] Инкрементирован регистр {30001 + reg_idx} ({param_name}, условно-негодный, больше нормы)")
+                            if has_cond_bad_less:
+                                reg_idx = regs['cond_bad_less']
+                                current = self.modbus_server.slave_context.getValues(4, reg_idx, 1)[0]
+                                self.modbus_server.slave_context.setValues(4, reg_idx, [current + 1])
+                                print(f" [СТАТИСТИКА] Инкрементирован регистр {30001 + reg_idx} ({param_name}, условно-негодный, меньше нормы)")
+                        
+                        if result == 'BAD' and param_status == 'BAD':
+                            if has_bad_greater:
+                                reg_idx = regs['bad_greater']
+                                current = self.modbus_server.slave_context.getValues(4, reg_idx, 1)[0]
+                                self.modbus_server.slave_context.setValues(4, reg_idx, [current + 1])
+                                print(f" [СТАТИСТИКА] Инкрементирован регистр {30001 + reg_idx} ({param_name}, негодный, больше нормы)")
+                            if has_bad_less:
+                                reg_idx = regs['bad_less']
+                                current = self.modbus_server.slave_context.getValues(4, reg_idx, 1)[0]
+                                self.modbus_server.slave_context.setValues(4, reg_idx, [current + 1])
+                                print(f" [СТАТИСТИКА] Инкрементирован регистр {30001 + reg_idx} ({param_name}, негодный, меньше нормы)")
+            
+        except Exception as e:
+            print(f" Ошибка инкрементации статистики параметров: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def check_shift_change(self):
         """
         Проверка смены смены и сброс счётчиков при необходимости
@@ -1464,9 +1970,36 @@ class LaserGeometrySystem:
             # Читаем текущее значение смены из регистра 40100
             new_shift_number = self.modbus_server.slave_context.getValues(3, 99, 1)[0]
             
-            # Если смена изменилась
+            # При первом запуске просто синхронизируемся без сброса
+            if not self.shift_initialized:
+                self.current_shift_number = new_shift_number
+                self.shift_initialized = True
+                print(f" [SHIFT] Инициализация смены: текущая смена = {new_shift_number} (без сброса)")
+                return
+
+            # Если смена изменилась после инициализации
             if new_shift_number != self.current_shift_number:
                 print(f" Обнаружена смена смены: {self.current_shift_number} -> {new_shift_number}")
+                
+                previous_shift = self.current_shift_number
+                if previous_shift is not None:
+                    self.generate_shift_report(previous_shift)
+                    # Очищаем измерения предыдущей смены после формирования отчёта
+                    if self.db_integration:
+                        try:
+                            self.db_integration.db.clear_shift_measurements(previous_shift)
+                        except Exception as e:
+                            print(f" [SHIFT] Ошибка очистки измерений смены {previous_shift}: {e}")
+                
+                # Принудительно сохраняем новый номер смены в БД
+                if self.db_integration:
+                    try:
+                        self.db_integration.db.save_single_register(
+                            40100, 'holding', int(new_shift_number), "Номер смены"
+                        )
+                        print(f" [SHIFT] Сохранен номер смены {new_shift_number} в БД")
+                    except Exception as e:
+                        print(f" [SHIFT] Ошибка сохранения номера смены в БД: {e}")
                 
                 # Сбрасываем все счётчики изделий
                 self.reset_product_counters()
@@ -1479,7 +2012,7 @@ class LaserGeometrySystem:
     
     def reset_product_counters(self):
         """
-        Сброс всех счётчиков изделий при смене смены
+        Сброс всех счётчиков изделий и статистики параметров при смене смены
         """
         try:
             if not self.modbus_server or not self.modbus_server.slave_context:
@@ -1491,7 +2024,16 @@ class LaserGeometrySystem:
             self.modbus_server.slave_context.setValues(4, 102, [0])  # 30103 - условно-годных
             self.modbus_server.slave_context.setValues(4, 103, [0])  # 30104 - негодных
             
-            print(" Счётчики изделий сброшены для новой смены")
+            # Сбрасываем регистры статистики параметров 30201-30223
+            # Условно-негодные (30201-30209): индексы 200-208
+            for idx in range(200, 209):
+                self.modbus_server.slave_context.setValues(4, idx, [0])
+            
+            # Негодные (30210-30223): индексы 209-222
+            for idx in range(209, 223):
+                self.modbus_server.slave_context.setValues(4, idx, [0])
+            
+            print(" Счётчики изделий и статистика параметров сброшены для новой смены")
             
         except Exception as e:
             print(f" Ошибка сброса счётчиков: {e}")
@@ -2489,7 +3031,7 @@ class LaserGeometrySystem:
     
     def handle_calibrate_flange_state(self):
         """
-        CMD=102: Калибровка эталонного диаметра (фланца)
+        CMD=102: Калибровка эталонного диаметра корпуса
         - Читаем эталонный диаметр из регистров 40006-40007
         - Непрерывно собираем данные от датчика 1 до получения CMD=0
         - Расчет и запись результатов выполняется при переходе CMD -> 0
@@ -4362,15 +4904,22 @@ class LaserGeometrySystem:
                 # Оценка качества изделия
                 quality_result = self.evaluate_product_quality()
                 
+                # Извлекаем итоговый результат
+                result = quality_result.get('result', 'BAD') if isinstance(quality_result, dict) else quality_result
+                
                 # Обновление счётчиков изделий
-                self.update_product_counters(quality_result)
+                self.update_product_counters(result)
+                
+                # Инкрементация статистики параметров
+                if isinstance(quality_result, dict):
+                    self.increment_parameter_statistics(quality_result)
                 
                 # Увеличиваем номер изделия
                 self.increment_product_number()
                 
                 # Устанавливаем статус "готово к завершению"
                 self.write_cycle_flag(116)
-                print(f" [STATUS=116] Оценка завершена ({quality_result}), готов к CMD=0")
+                print(f" [STATUS=116] Оценка завершена ({result}), готов к CMD=0")
                 
                 # Отмечаем что оценка выполнена
                 self.quality_evaluated = True
@@ -4554,8 +5103,169 @@ class LaserGeometrySystem:
         print(" Состояние ошибки. Проверьте систему.")
 
 
+def check_single_instance():
+    """Проверка, что запущен только один экземпляр программы"""
+    current_pid = os.getpid()
+    script_name = os.path.basename(__file__)
+    
+    # Метод 1: Проверка через поиск других процессов с тем же скриптом
+    if HAS_PSUTIL:
+        try:
+            found_processes = []
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if proc.info['pid'] == current_pid:
+                        continue
+                    
+                    cmdline = proc.info.get('cmdline', [])
+                    if cmdline and any(script_name in str(arg) for arg in cmdline):
+                        # Найден другой процесс с тем же скриптом
+                        other_pid = proc.info['pid']
+                        # Проверяем, что это действительно наш скрипт
+                        if any('laser_geometry_system.py' in str(arg) for arg in cmdline):
+                            found_processes.append(other_pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            # Если найдены другие процессы, ждем немного и проверяем снова
+            # (возможно, это старые процессы, которые завершаются)
+            if found_processes:
+                print(f"[ПРОВЕРКА] Найдены другие процессы: {found_processes}, ожидание 2 секунды...")
+                time.sleep(2)
+                
+                # Повторная проверка
+                still_running = []
+                for pid in found_processes:
+                    if os.path.exists(f'/proc/{pid}'):
+                        try:
+                            proc = psutil.Process(pid)
+                            cmdline = proc.cmdline()
+                            if any('laser_geometry_system.py' in str(arg) for arg in cmdline):
+                                still_running.append(pid)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass  # Процесс завершился
+                
+                if still_running:
+                    return False, f"Программа уже запущена (PID: {still_running})"
+        except Exception as e:
+            pass  # Если не удалось проверить через psutil, продолжаем
+    
+    # Метод 2: Проверка через socket (порт 502)
+    try:
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        test_sock.settimeout(0.1)
+        result = test_sock.connect_ex(('192.168.1.50', 502))
+        test_sock.close()
+        if result == 0:
+            # Порт занят - возможно, другой процесс уже запущен
+            return False, "Порт 502 уже занят (возможно, программа уже запущена)"
+    except Exception:
+        pass  # Если не удалось проверить порт, продолжаем
+    
+    # Метод 3: Lock файл с fcntl (самый надежный для Linux)
+    lock_file_path = '/tmp/laser_geometry_system.lock'
+    lock_file = None
+    
+    try:
+        # Пытаемся открыть lock файл
+        lock_file = open(lock_file_path, 'w')
+        
+        # Пытаемся заблокировать файл (неблокирующий режим)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        # Записываем PID текущего процесса
+        lock_file.write(str(current_pid))
+        lock_file.flush()
+        
+        # Функция для очистки lock файла при выходе
+        def cleanup_lock():
+            try:
+                if lock_file:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    lock_file.close()
+                if os.path.exists(lock_file_path):
+                    os.remove(lock_file_path)
+            except:
+                pass
+        
+        # Регистрируем очистку при выходе
+        import atexit
+        atexit.register(cleanup_lock)
+        
+        return True, None
+        
+    except (IOError, OSError) as e:
+        # Файл уже заблокирован - другой процесс запущен
+        if lock_file:
+            lock_file.close()
+        
+        # Проверяем, действительно ли процесс еще работает
+        try:
+            if os.path.exists(lock_file_path):
+                with open(lock_file_path, 'r') as f:
+                    pid_str = f.read().strip()
+                    if pid_str:
+                        old_pid = int(pid_str)
+                        
+                        # Проверяем, существует ли процесс с этим PID
+                        if os.path.exists(f'/proc/{old_pid}'):
+                            return False, f"Программа уже запущена (PID: {old_pid})"
+                        else:
+                            # Процесс не существует, удаляем старый lock файл
+                            try:
+                                os.remove(lock_file_path)
+                                # Пытаемся запуститься снова
+                                return check_single_instance()
+                            except:
+                                return False, "Не удалось удалить старый lock файл"
+                    else:
+                        # Lock файл пустой, удаляем его
+                        try:
+                            os.remove(lock_file_path)
+                            return check_single_instance()
+                        except:
+                            return False, "Не удалось удалить пустой lock файл"
+            else:
+                # Lock файл не существует, но fcntl не смог заблокировать
+                return False, "Не удалось заблокировать файл (возможно, другой процесс использует его)"
+        except (ValueError, OSError) as e:
+            # Ошибка при чтении/проверке lock файла
+            try:
+                if os.path.exists(lock_file_path):
+                    os.remove(lock_file_path)
+                    return check_single_instance()
+            except:
+                pass
+            return False, f"Ошибка проверки lock файла: {e}"
+    
+    except Exception as e:
+        if lock_file:
+            lock_file.close()
+        return False, f"Ошибка проверки единственного экземпляра: {e}"
+
+
 def main():
     """Главная функция"""
+    # ВАЖНО: Проверка на единственный экземпляр должна быть ПЕРВОЙ операцией
+    # до любых других действий, чтобы предотвратить race condition
+    can_run, error_msg = check_single_instance()
+    if not can_run:
+        print(f"ОШИБКА: {error_msg}")
+        print("Программа уже запущена. Завершаем...")
+        sys.exit(1)
+    
+    # Небольшая задержка, чтобы дать время первому процессу полностью инициализироваться
+    # Это помогает предотвратить ситуацию, когда два процесса проходят проверку почти одновременно
+    time.sleep(0.5)
+    
+    # Повторная проверка после задержки (на случай, если другой процесс успел запуститься)
+    can_run, error_msg = check_single_instance()
+    if not can_run:
+        print(f"ОШИБКА: {error_msg}")
+        print("Обнаружен другой экземпляр после задержки. Завершаем...")
+        sys.exit(1)
+    
     print("СИСТЕМА ЛАЗЕРНОЙ ГЕОМЕТРИИ")
     print("Интеграция датчиков РФ602 + Modbus + Автомат состояний")
     print("=" * 60)
