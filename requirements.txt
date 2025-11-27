@@ -2,7 +2,7 @@
 pyserial>=3.5
 # pymodbus: протестировано на версии 3.5.4 и 3.6.0+
 # Для установки конкретной версии: pip install pymodbus==3.5.4
-pymodbus>=3.5.4,<4.0.0
+pymodbus==3.5.4
 psutil>=5.9.0
 python-docx>=0.8.11
 
