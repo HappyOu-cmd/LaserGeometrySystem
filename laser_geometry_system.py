@@ -4112,39 +4112,107 @@ class LaserGeometrySystem:
             
             # Вычисляем статистику для диаметра корпуса
             # Фильтруем некорректные значения (0, отрицательные, NaN, inf) перед вычислением статистики
-            valid_body_diameters = [d for d in self.body_diameter_buffer 
-                                   if d is not None and d > 0 and not (math.isnan(d) or math.isinf(d))]
-            if len(valid_body_diameters) == 0:
-                print(" ОШИБКА: Нет валидных значений диаметра корпуса!")
+            valid_body_radii = [r for r in self.body_diameter_buffer 
+                               if r is not None and r > 0 and not (math.isnan(r) or math.isinf(r))]
+            if len(valid_body_radii) == 0:
+                print(" ОШИБКА: Нет валидных значений радиуса корпуса!")
                 return
             
-            # Применяем экстраполяцию к диаметру корпуса
+            # Применяем экстраполяцию к радиусам корпуса
             body_extrapolation_coeff = self.read_body_diameter_extrapolation_coeff()
             if abs(body_extrapolation_coeff) > 0.0001:
-                valid_body_diameters = self.apply_extrapolation_to_buffer(valid_body_diameters, body_extrapolation_coeff)
-                print(f" [ЭКСТРАПОЛЯЦИЯ] Применен коэффициент {body_extrapolation_coeff:.6f} к диаметру корпуса")
+                valid_body_radii = self.apply_extrapolation_to_buffer(valid_body_radii, body_extrapolation_coeff)
+                print(f" [ЭКСТРАПОЛЯЦИЯ] Применен коэффициент {body_extrapolation_coeff:.6f} к радиусу корпуса")
             
-            max_body_diameter = max(valid_body_diameters)
-            min_body_diameter = min(valid_body_diameters)
-            avg_body_diameter = sum(valid_body_diameters) / len(valid_body_diameters)
+            # Вычисляем диаметры из противоположных точек (0° и 180°)
+            # Формула: (distance_to_center - avg_sensor1_0deg) + (distance_to_center - avg_sensor1_180deg) + offset
+            body_diameter_offset = self.read_body_diameter_offset_coeff()
+            opposite_body_diameters = []
+            
+            if len(valid_body_radii) >= 2:
+                # Определяем количество измерений за полный оборот (360°)
+                # Для любого количества оборотов (360°, 720°, 1080° и т.д.)
+                # противоположная точка всегда на расстоянии N/2
+                total_measurements = len(valid_body_radii)
+                half_size = total_measurements // 2
+                
+                # Берем противоположные точки (смещенные на 180 градусов)
+                for i in range(half_size):
+                    radius_0deg = valid_body_radii[i]          # Точка на текущем угле
+                    radius_180deg = valid_body_radii[i + half_size]  # Точка на 180° от текущей
+                    # Формула: (distance_to_center - avg_sensor1_0deg) + (distance_to_center - avg_sensor1_180deg) + offset
+                    body_diameter = radius_0deg + radius_180deg + body_diameter_offset
+                    opposite_body_diameters.append(body_diameter)
+                
+                if len(opposite_body_diameters) > 0:
+                    max_body_diameter = max(opposite_body_diameters)
+                    min_body_diameter = min(opposite_body_diameters)
+                    avg_body_diameter = sum(opposite_body_diameters) / len(opposite_body_diameters)
+                    print(f" [DIAMETER] Вычислено {len(opposite_body_diameters)} диаметров корпуса из противоположных точек")
+                else:
+                    # Fallback: если не удалось вычислить противоположные точки
+                    print(" [WARNING] Не удалось вычислить диаметры корпуса из противоположных точек, используем старый метод")
+                    max_body_diameter = max(valid_body_radii) * 2 + body_diameter_offset
+                    min_body_diameter = min(valid_body_radii) * 2 + body_diameter_offset
+                    avg_body_diameter = (sum(valid_body_radii) / len(valid_body_radii)) * 2 + body_diameter_offset
+            else:
+                # Если измерений недостаточно для противоположных точек
+                print(" [WARNING] Недостаточно измерений для противоположных точек корпуса, используем старый метод")
+                max_body_diameter = max(valid_body_radii) * 2 + body_diameter_offset
+                min_body_diameter = min(valid_body_radii) * 2 + body_diameter_offset
+                avg_body_diameter = (sum(valid_body_radii) / len(valid_body_radii)) * 2 + body_diameter_offset
             
             # Вычисляем статистику для диаметра фланца
             # Фильтруем некорректные значения (0, отрицательные, NaN, inf) перед вычислением статистики
-            valid_flange_diameters = [d for d in self.flange_diameter_buffer 
-                                     if d is not None and d > 0 and not (math.isnan(d) or math.isinf(d))]
-            if len(valid_flange_diameters) == 0:
-                print(" ОШИБКА: Нет валидных значений диаметра фланца!")
+            valid_flange_radii = [r for r in self.flange_diameter_buffer 
+                                 if r is not None and r > 0 and not (math.isnan(r) or math.isinf(r))]
+            if len(valid_flange_radii) == 0:
+                print(" ОШИБКА: Нет валидных значений радиуса фланца!")
                 return
             
-            # Применяем экстраполяцию к диаметру фланца
+            # Применяем экстраполяцию к радиусам фланца
             flange_extrapolation_coeff = self.read_flange_diameter_extrapolation_coeff()
             if abs(flange_extrapolation_coeff) > 0.0001:
-                valid_flange_diameters = self.apply_extrapolation_to_buffer(valid_flange_diameters, flange_extrapolation_coeff)
-                print(f" [ЭКСТРАПОЛЯЦИЯ] Применен коэффициент {flange_extrapolation_coeff:.6f} к диаметру фланца")
+                valid_flange_radii = self.apply_extrapolation_to_buffer(valid_flange_radii, flange_extrapolation_coeff)
+                print(f" [ЭКСТРАПОЛЯЦИЯ] Применен коэффициент {flange_extrapolation_coeff:.6f} к радиусу фланца")
             
-            max_flange_diameter = max(valid_flange_diameters)
-            min_flange_diameter = min(valid_flange_diameters)
-            avg_flange_diameter = sum(valid_flange_diameters) / len(valid_flange_diameters)
+            # Вычисляем диаметры фланца из противоположных точек (0° и 180°)
+            # Формула: (distance_to_center_flange - avg_sensor3_0deg) + (distance_to_center_flange - avg_sensor3_180deg) + offset
+            flange_diameter_offset = self.read_flange_diameter_offset_coeff()
+            opposite_flange_diameters = []
+            
+            if len(valid_flange_radii) >= 2:
+                # Определяем количество измерений за полный оборот (360°)
+                # Для любого количества оборотов (360°, 720°, 1080° и т.д.)
+                # противоположная точка всегда на расстоянии N/2
+                total_measurements = len(valid_flange_radii)
+                half_size = total_measurements // 2
+                
+                # Берем противоположные точки (смещенные на 180 градусов)
+                for i in range(half_size):
+                    radius_0deg = valid_flange_radii[i]          # Точка на текущем угле
+                    radius_180deg = valid_flange_radii[i + half_size]  # Точка на 180° от текущей
+                    # Формула: (distance_to_center_flange - avg_sensor3_0deg) + (distance_to_center_flange - avg_sensor3_180deg) + offset
+                    flange_diameter = radius_0deg + radius_180deg + flange_diameter_offset
+                    opposite_flange_diameters.append(flange_diameter)
+                
+                if len(opposite_flange_diameters) > 0:
+                    max_flange_diameter = max(opposite_flange_diameters)
+                    min_flange_diameter = min(opposite_flange_diameters)
+                    avg_flange_diameter = sum(opposite_flange_diameters) / len(opposite_flange_diameters)
+                    print(f" [DIAMETER] Вычислено {len(opposite_flange_diameters)} диаметров фланца из противоположных точек")
+                else:
+                    # Fallback: если не удалось вычислить противоположные точки
+                    print(" [WARNING] Не удалось вычислить диаметры фланца из противоположных точек, используем старый метод")
+                    max_flange_diameter = max(valid_flange_radii) * 2 + flange_diameter_offset
+                    min_flange_diameter = min(valid_flange_radii) * 2 + flange_diameter_offset
+                    avg_flange_diameter = (sum(valid_flange_radii) / len(valid_flange_radii)) * 2 + flange_diameter_offset
+            else:
+                # Если измерений недостаточно для противоположных точек
+                print(" [WARNING] Недостаточно измерений для противоположных точек фланца, используем старый метод")
+                max_flange_diameter = max(valid_flange_radii) * 2 + flange_diameter_offset
+                min_flange_diameter = min(valid_flange_radii) * 2 + flange_diameter_offset
+                avg_flange_diameter = (sum(valid_flange_radii) / len(valid_flange_radii)) * 2 + flange_diameter_offset
             
             # Толщина фланца теперь передаётся с ПК, не рассчитывается здесь
             
@@ -4381,22 +4449,15 @@ class LaserGeometrySystem:
                     if (distance_to_center is not None and distance_to_center_flange is not None and 
                         distance_1_3 is not None and distance_sensor4 is not None):
                         
-                        # 1) Диаметр корпуса (Датчик 1)
-                        # Формула: (расстояние до центра - показание датчика 1) * 2
-                        if recipe_diametr_body and recipe_diametr_body > 0:
-                            body_diameter = (distance_to_center - avg_sensor1) + (recipe_diametr_body/2) + body_diameter_offset
-                        else:
-                            body_diameter = (distance_to_center - avg_sensor1) * 2 + body_diameter_offset
-
-                        self.body_diameter_buffer.append(body_diameter)
+                        # 1) Радиус корпуса (Датчик 1) - сохраняем радиус для последующего расчета из противоположных точек
+                        # Формула: (расстояние до центра - показание датчика 1)
+                        body_radius = distance_to_center - avg_sensor1
+                        self.body_diameter_buffer.append(body_radius)  # Временно используем тот же буфер для радиусов
                         
-                        # 2) Диаметр фланца (Датчик 3)
-                        # Формула: (расстояние датчика 3 до центра - показание датчика 3) * 2
-                        if recipe_diametr_flange and recipe_diametr_flange > 0: 
-                            flange_diameter = (distance_to_center_flange - avg_sensor3) + (recipe_diametr_flange/2) + flange_diameter_offset
-                        else:
-                            flange_diameter = (distance_to_center_flange - avg_sensor3) * 2 + flange_diameter_offset
-                        self.flange_diameter_buffer.append(flange_diameter)
+                        # 2) Радиус фланца (Датчик 3) - сохраняем радиус для последующего расчета из противоположных точек
+                        # Формула: (расстояние датчика 3 до центра - показание датчика 3)
+                        flange_radius = distance_to_center_flange - avg_sensor3
+                        self.flange_diameter_buffer.append(flange_radius)  # Временно используем тот же буфер для радиусов
                         
                         # 3) Толщина фланца - теперь передаётся с ПК, не рассчитывается здесь
                         
@@ -4407,7 +4468,7 @@ class LaserGeometrySystem:
                         # Выводим прогресс каждые 100 усредненных измерений
                         if len(self.body_diameter_buffer) % 100 == 0:
                             print(f" [CMD=12] Собрано: {len(self.body_diameter_buffer)} измерений")
-                            print(f"   Диаметр корпуса={body_diameter:.3f}мм, Диаметр фланца={flange_diameter:.3f}мм")
+                            print(f"   Радиус корпуса={body_radius:.3f}мм, Радиус фланца={flange_radius:.3f}мм")
                             print(f"   Толщина дна={bottom_thickness:.3f}мм")
                     else:
                         print(" Ошибка: не удалось прочитать калиброванные значения")
