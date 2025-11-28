@@ -13,6 +13,7 @@ import math
 import contextlib
 import fcntl
 import sys
+import shutil
 from datetime import datetime
 from queue import Queue, Empty
 from enum import Enum
@@ -1755,9 +1756,51 @@ class LaserGeometrySystem:
             
             document.save(filepath)
             print(f" [REPORT] Сформирован отчёт по смене {shift_number}: {filepath}")
+            
+            # Копируем отчёт на флешку, если она доступна
+            self.copy_report_to_flash(filepath, filename)
         
         except Exception as e:
             print(f" [REPORT] Ошибка формирования отчёта: {e}")
+    
+    def copy_report_to_flash(self, source_filepath: str, filename: str):
+        """
+        Копирует отчёт на флешку, если она доступна
+        
+        Args:
+            source_filepath: Полный путь к исходному файлу отчёта
+            filename: Имя файла отчёта
+        """
+        # Путь к флешке
+        flash_drive_path = "/media/stend_1/ARS"
+        
+        try:
+            # Проверяем, существует ли флешка
+            if not os.path.exists(flash_drive_path):
+                print(f" [REPORT] Флешка не найдена: {flash_drive_path}")
+                return
+            
+            # Проверяем, что это директория и доступна для записи
+            if not os.path.isdir(flash_drive_path):
+                print(f" [REPORT] Путь не является директорией: {flash_drive_path}")
+                return
+            
+            if not os.access(flash_drive_path, os.W_OK):
+                print(f" [REPORT] Нет прав на запись в: {flash_drive_path}")
+                return
+            
+            # Создаём путь для сохранения на флешке
+            flash_filepath = os.path.join(flash_drive_path, filename)
+            
+            # Копируем файл
+            shutil.copy2(source_filepath, flash_filepath)
+            
+            print(f" [REPORT] Отчёт скопирован на флешку: {flash_filepath}")
+            
+        except PermissionError:
+            print(f" [REPORT] Ошибка доступа к флешке {flash_drive_path}: нет прав на запись")
+        except Exception as e:
+            print(f" [REPORT] Ошибка копирования отчёта на флешку: {e}")
     
     def update_product_counters(self, result: str):
         """
