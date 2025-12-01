@@ -3,7 +3,6 @@
 
 # Определяем путь к проекту (текущая директория)
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-USER_NAME=$(whoami)
 SERVICE_NAME="laser_geometry.service"
 SERVICE_DIR="$HOME/.config/systemd/user"
 
@@ -11,7 +10,7 @@ echo "=========================================="
 echo "Настройка автозапуска Laser Geometry System"
 echo "=========================================="
 echo "Путь к проекту: $PROJECT_DIR"
-echo "Пользователь: $USER_NAME"
+echo "Пользователь: $(whoami)"
 echo ""
 
 # Проверяем наличие виртуального окружения
@@ -41,8 +40,6 @@ cat > "$SERVICE_FILE" << EOF
 Description=Laser Geometry System
 After=network-online.target
 Wants=network-online.target
-# Дополнительная задержка для готовности IP адреса
-StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -50,13 +47,14 @@ WorkingDirectory=$PROJECT_DIR
 ExecStart=$PROJECT_DIR/.venv/bin/python3 $PROJECT_DIR/laser_geometry_system.py
 Restart=always
 RestartSec=10
+# Лимит перезапусков: максимум 5 раз за 5 минут
+StartLimitIntervalSec=300
+StartLimitBurst=5
 StandardOutput=journal
 StandardError=journal
-# Предотвращаем запуск нескольких экземпляров через systemd
-ExecStartPre=/bin/sleep 2
 
 # Переменные окружения
-Environment="PATH=$PROJECT_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=$PROJECT_DIR/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Убираем проверку групп, которая может вызывать ошибки
 SupplementaryGroups=
@@ -68,7 +66,22 @@ EOF
 echo "✓ Файл сервиса создан: $SERVICE_FILE"
 echo ""
 
+# Проверяем и включаем linger для автозапуска без активной сессии
+echo "Проверка linger для автозапуска без активной сессии..."
+if ! loginctl show-user "$(whoami)" | grep -q "Linger=yes"; then
+    echo "Включение linger (требуются права sudo)..."
+    sudo loginctl enable-linger "$(whoami)"
+    if [ $? -eq 0 ]; then
+        echo "✓ Linger включен"
+    else
+        echo "⚠ Предупреждение: не удалось включить linger. Сервис будет запускаться только при активной сессии пользователя."
+    fi
+else
+    echo "✓ Linger уже включен"
+fi
+
 # Перезагружаем конфигурацию systemd
+echo ""
 echo "Перезагрузка конфигурации systemd..."
 systemctl --user daemon-reload
 
