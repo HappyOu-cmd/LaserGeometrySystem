@@ -125,6 +125,8 @@ class SystemState(Enum):
     CALIBRATE_FLANGE = "CALIBRATE_FLANGE"
     CALIBRATE_HEIGHT = "CALIBRATE_HEIGHT"
     CALIBRATE_FLANGE_DIAMETER = "CALIBRATE_FLANGE_DIAMETER"
+    CALIBRATE_BODY_DIAMETER_SEPARATE = "CALIBRATE_BODY_DIAMETER_SEPARATE"  # CMD=107
+    CALIBRATE_BODY2_DIAMETER = "CALIBRATE_BODY2_DIAMETER"  # CMD=108
     DEBUG_REGISTERS = "DEBUG_REGISTERS"
     CONFIGURE_SENSOR3_RANGE = "CONFIGURE_SENSOR3_RANGE"  # CMD=106: настройка диапазонов датчика 3
     
@@ -138,6 +140,12 @@ class SystemState(Enum):
     # Основной цикл измерения - фланец
     MEASURE_FLANGE_PROCESS = "MEASURE_FLANGE_PROCESS"      # CMD=12: сбор данных
     MEASURE_FLANGE_CALCULATE = "MEASURE_FLANGE_CALCULATE"  # CMD=13: подсчёт результатов
+    MEASURE_FLANGE_ONLY_PROCESS = "MEASURE_FLANGE_ONLY_PROCESS"      # CMD=20
+    MEASURE_FLANGE_ONLY_CALCULATE = "MEASURE_FLANGE_ONLY_CALCULATE"  # CMD=21
+    MEASURE_BODY_ONLY_PROCESS = "MEASURE_BODY_ONLY_PROCESS"      # CMD=30
+    MEASURE_BODY_ONLY_CALCULATE = "MEASURE_BODY_ONLY_CALCULATE"  # CMD=31
+    MEASURE_BODY2_PROCESS = "MEASURE_BODY2_PROCESS"      # CMD=40
+    MEASURE_BODY2_CALCULATE = "MEASURE_BODY2_CALCULATE"  # CMD=41
     
     # Основной цикл измерения - нижняя стенка
     MEASURE_BOTTOM_PROCESS = "MEASURE_BOTTOM_PROCESS"      # CMD=14: сбор данных
@@ -244,7 +252,11 @@ class LaserGeometrySystem:
         self.wall_calculated = False
         self.flange_calculated = False
         self.bottom_calculated = False
+        self.flange_only_calculated = False
+        self.body_only_calculated = False
+        self.body2_calculated = False
         self.quality_evaluated = False
+        self.body2_quality_required = False
         
         # Мониторинг в состоянии ожидания (IDLE)
         self.idle_monitor_last_time = 0.0
@@ -258,6 +270,8 @@ class LaserGeometrySystem:
         self.cached_distance_1_3 = None
         self.cached_distance_sensor4 = None
         self.cached_distance_sensor3_to_center = None
+        self.cached_distance_sensor3_to_center_body = None
+        self.cached_distance_sensor3_to_center_body2 = None
         
         # Отслеживание смены для сброса счётчиков
         self.current_shift_number = 1  # Текущая смена
@@ -303,6 +317,16 @@ class LaserGeometrySystem:
         
         # Расчетный буфер для команды 12
         self.bottom_wall_thickness_buffer = []  # Буфер толщины нижней стенки
+
+        # Буферы для раздельных команд диаметров (20/30/40)
+        self.sensor3_flange_only_measurements = []
+        self.sensor3_body_only_measurements = []
+        self.sensor3_body2_measurements = []
+        self.temp_sensor3_flange_only_buffer = []
+        self.temp_sensor3_body_only_buffer = []
+        self.temp_sensor3_body2_buffer = []
+        self.body_only_diameter_buffer = []
+        self.body2_diameter_buffer = []
         
     def start_system(self):
         """Запуск системы"""
@@ -605,9 +629,12 @@ class LaserGeometrySystem:
                 # Пауза только если НЕ потоковый режим (иначе тормозит поток!)
                 if self.current_state not in [SystemState.STREAM_QUAD, 
                                              SystemState.MEASURE_HEIGHT_PROCESS, SystemState.MEASURE_WALL_PROCESS, 
-                                             SystemState.MEASURE_FLANGE_PROCESS, SystemState.MEASURE_BOTTOM_PROCESS,
+                                             SystemState.MEASURE_FLANGE_PROCESS, SystemState.MEASURE_FLANGE_ONLY_PROCESS,
+                                             SystemState.MEASURE_BODY_ONLY_PROCESS, SystemState.MEASURE_BODY2_PROCESS,
+                                             SystemState.MEASURE_BOTTOM_PROCESS,
                                              SystemState.CALIBRATE_HEIGHT,SystemState.CALIBRATE_WALL,SystemState.CALIBRATE_FLANGE,
-                                             SystemState.CALIBRATE_FLANGE_DIAMETER,SystemState.CALIBRATE_BOTTOM]:
+                                             SystemState.CALIBRATE_FLANGE_DIAMETER, SystemState.CALIBRATE_BODY_DIAMETER_SEPARATE,
+                                             SystemState.CALIBRATE_BODY2_DIAMETER, SystemState.CALIBRATE_BOTTOM]:
                     time.sleep(0.1)
                 elif self.current_state == SystemState.STREAM_QUAD:
                     # Микро-пауза в QUAD режиме для снижения нагрузки на CPU (5 мс)
@@ -662,6 +689,10 @@ class LaserGeometrySystem:
         elif cmd == 106:
             # Команда 106: Настройка диапазонов для дискретного сигнала датчика 3
             self.current_state = SystemState.CONFIGURE_SENSOR3_RANGE
+        elif cmd == 107:
+            self.current_state = SystemState.CALIBRATE_BODY_DIAMETER_SEPARATE
+        elif cmd == 108:
+            self.current_state = SystemState.CALIBRATE_BODY2_DIAMETER
             
         # Измерение верхней стенки
         elif cmd == 10:
@@ -682,6 +713,19 @@ class LaserGeometrySystem:
             self.current_state = SystemState.MEASURE_FLANGE_PROCESS
         elif cmd == 13:
             self.current_state = SystemState.MEASURE_FLANGE_CALCULATE
+        elif cmd == 20:
+            self.current_state = SystemState.MEASURE_FLANGE_ONLY_PROCESS
+        elif cmd == 21:
+            self.current_state = SystemState.MEASURE_FLANGE_ONLY_CALCULATE
+        elif cmd == 30:
+            self.current_state = SystemState.MEASURE_BODY_ONLY_PROCESS
+        elif cmd == 31:
+            self.current_state = SystemState.MEASURE_BODY_ONLY_CALCULATE
+        elif cmd == 40:
+            self.current_state = SystemState.MEASURE_BODY2_PROCESS
+            self.body2_quality_required = True
+        elif cmd == 41:
+            self.current_state = SystemState.MEASURE_BODY2_CALCULATE
             
         # Основной цикл измерения - нижняя стенка
         elif cmd == 14:
@@ -711,6 +755,15 @@ class LaserGeometrySystem:
         12  - измерение фланца
         13  - подсчёт фланца
         112 - подсчёт завершён, готов к CMD=14
+        20  - раздельное измерение фланца
+        21  - раздельный подсчёт фланца
+        212 - раздельный подсчёт фланца завершён
+        30  - раздельное измерение диаметра корпуса
+        31  - раздельный подсчёт диаметра корпуса
+        312 - раздельный подсчёт диаметра корпуса завершён
+        40  - измерение диаметра корпуса 2
+        41  - подсчёт диаметра корпуса 2
+        412 - подсчёт диаметра корпуса 2 завершён
         14  - измерение нижней стенки
         15  - подсчёт нижней стенки
         114 - подсчёт завершён, готов к CMD=16
@@ -751,12 +804,19 @@ class LaserGeometrySystem:
                 self.wall_calculated = False
                 self.flange_calculated = False
                 self.bottom_calculated = False
+                self.flange_only_calculated = False
+                self.body_only_calculated = False
+                self.body2_calculated = False
                 self.quality_evaluated = False
+                self.body2_quality_required = False
                 # Очищаем кеш калиброванных расстояний
                 self.cached_distance_1_2 = None
                 self.cached_distance_to_center = None
                 self.cached_distance_1_3 = None
                 self.cached_distance_sensor4 = None
+                self.cached_distance_sensor3_to_center = None
+                self.cached_distance_sensor3_to_center_body = None
+                self.cached_distance_sensor3_to_center_body2 = None
                 # Сбрасываем счетчики частоты
                 self.frequency_counter = 0
                 self.frequency_start_time = None
@@ -800,6 +860,40 @@ class LaserGeometrySystem:
                 self.flange_diameter_buffer = []
                 self.bottom_thickness_buffer = []
                 print(" [11→12] Все буферы измерения фланца очищены")
+            elif current_state_value == "MEASURE_WALL_CALCULATE" and new_cmd == 20:
+                self.write_cycle_flag(20)
+                self.flange_only_calculated = False
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                self.cached_distance_sensor3_to_center = None
+                self.sensor3_flange_only_measurements = []
+                self.temp_sensor3_flange_only_buffer = []
+                self.flange_diameter_buffer = []
+                print(" [11→20] Начало раздельного измерения фланца")
+            elif current_state_value == "MEASURE_WALL_CALCULATE" and new_cmd == 30:
+                self.write_cycle_flag(30)
+                self.body_only_calculated = False
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                self.cached_distance_sensor3_to_center_body = None
+                self.sensor3_body_only_measurements = []
+                self.temp_sensor3_body_only_buffer = []
+                self.body_only_diameter_buffer = []
+                print(" [11→30] Начало раздельного измерения диаметра корпуса")
+            elif current_state_value == "MEASURE_WALL_CALCULATE" and new_cmd == 40:
+                self.write_cycle_flag(40)
+                self.body2_calculated = False
+                self.body2_quality_required = True
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                self.cached_distance_sensor3_to_center_body2 = None
+                self.sensor3_body2_measurements = []
+                self.temp_sensor3_body2_buffer = []
+                self.body2_diameter_buffer = []
+                print(" [11→40] Начало измерения диаметра корпуса 2")
             
             # === ФЛАНЕЦ ===
             elif current_state_value == "MEASURE_FLANGE_PROCESS" and new_cmd == 13:
@@ -823,6 +917,112 @@ class LaserGeometrySystem:
                 if hasattr(self, '_bottom_frequency_initialized'):
                     delattr(self, '_bottom_frequency_initialized')
                 print(" [13→14] Подсчёт завершён, начало измерения нижней стенки")
+            elif current_state_value == "MEASURE_FLANGE_CALCULATE" and new_cmd == 30:
+                self.write_cycle_flag(30)
+                self.body_only_calculated = False
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                self.cached_distance_sensor3_to_center_body = None
+                self.sensor3_body_only_measurements = []
+                self.temp_sensor3_body_only_buffer = []
+                self.body_only_diameter_buffer = []
+                print(" [13→30] Начало раздельного измерения диаметра корпуса")
+            elif current_state_value == "MEASURE_FLANGE_CALCULATE" and new_cmd == 40:
+                self.write_cycle_flag(40)
+                self.body2_calculated = False
+                self.body2_quality_required = True
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                self.cached_distance_sensor3_to_center_body2 = None
+                self.sensor3_body2_measurements = []
+                self.temp_sensor3_body2_buffer = []
+                self.body2_diameter_buffer = []
+                print(" [13→40] Начало измерения диаметра корпуса 2")
+
+            # === РАЗДЕЛЬНЫЙ ФЛАНЕЦ ===
+            elif current_state_value == "MEASURE_FLANGE_ONLY_PROCESS" and new_cmd == 21:
+                self.write_cycle_flag(21)
+                if hasattr(self, '_flange_only_measurement_started'):
+                    delattr(self, '_flange_only_measurement_started')
+                print(" [20→21] Подсчёт результатов раздельного фланца...")
+            elif current_state_value == "MEASURE_FLANGE_ONLY_CALCULATE" and new_cmd == 14:
+                self.write_cycle_flag(14)
+                self.bottom_calculated = False
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                if hasattr(self, '_bottom_frequency_initialized'):
+                    delattr(self, '_bottom_frequency_initialized')
+                print(" [21→14] Подсчёт раздельного фланца завершён, начало измерения нижней стенки")
+            elif current_state_value == "MEASURE_FLANGE_ONLY_CALCULATE" and new_cmd == 30:
+                self.write_cycle_flag(30)
+                self.body_only_calculated = False
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                self.cached_distance_sensor3_to_center_body = None
+                self.sensor3_body_only_measurements = []
+                self.temp_sensor3_body_only_buffer = []
+                self.body_only_diameter_buffer = []
+                print(" [21→30] Начало раздельного измерения диаметра корпуса")
+            elif current_state_value == "MEASURE_FLANGE_ONLY_CALCULATE" and new_cmd == 40:
+                self.write_cycle_flag(40)
+                self.body2_calculated = False
+                self.body2_quality_required = True
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                self.cached_distance_sensor3_to_center_body2 = None
+                self.sensor3_body2_measurements = []
+                self.temp_sensor3_body2_buffer = []
+                self.body2_diameter_buffer = []
+                print(" [21→40] Начало измерения диаметра корпуса 2")
+
+            # === РАЗДЕЛЬНЫЙ ДИАМЕТР КОРПУСА ===
+            elif current_state_value == "MEASURE_BODY_ONLY_PROCESS" and new_cmd == 31:
+                self.write_cycle_flag(31)
+                if hasattr(self, '_body_only_measurement_started'):
+                    delattr(self, '_body_only_measurement_started')
+                print(" [30→31] Подсчёт раздельного диаметра корпуса...")
+            elif current_state_value == "MEASURE_BODY_ONLY_CALCULATE" and new_cmd == 14:
+                self.write_cycle_flag(14)
+                self.bottom_calculated = False
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                if hasattr(self, '_bottom_frequency_initialized'):
+                    delattr(self, '_bottom_frequency_initialized')
+                print(" [31→14] Подсчёт раздельного диаметра корпуса завершён, начало измерения нижней стенки")
+            elif current_state_value == "MEASURE_BODY_ONLY_CALCULATE" and new_cmd == 40:
+                self.write_cycle_flag(40)
+                self.body2_calculated = False
+                self.body2_quality_required = True
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                self.cached_distance_sensor3_to_center_body2 = None
+                self.sensor3_body2_measurements = []
+                self.temp_sensor3_body2_buffer = []
+                self.body2_diameter_buffer = []
+                print(" [31→40] Начало измерения диаметра корпуса 2")
+
+            # === ДИАМЕТР КОРПУСА 2 ===
+            elif current_state_value == "MEASURE_BODY2_PROCESS" and new_cmd == 41:
+                self.write_cycle_flag(41)
+                if hasattr(self, '_body2_measurement_started'):
+                    delattr(self, '_body2_measurement_started')
+                print(" [40→41] Подсчёт диаметра корпуса 2...")
+            elif current_state_value == "MEASURE_BODY2_CALCULATE" and new_cmd == 14:
+                self.write_cycle_flag(14)
+                self.bottom_calculated = False
+                self.frequency_counter = 0
+                self.frequency_start_time = None
+                self.last_frequency_display = 0
+                if hasattr(self, '_bottom_frequency_initialized'):
+                    delattr(self, '_bottom_frequency_initialized')
+                print(" [41→14] Подсчёт диаметра корпуса 2 завершён, начало измерения нижней стенки")
             
             # === НИЖНЯЯ СТЕНКА ===
             elif current_state_value == "MEASURE_BOTTOM_PROCESS" and new_cmd == 15:
@@ -873,7 +1073,7 @@ class LaserGeometrySystem:
                 self.clear_serial_buffers()
                 print(" [104→0] Отладка регистров завершена, возврат в IDLE")
             
-            # === ЗАВЕРШЕНИЕ КАЛИБРОВОК 100/101/102/105 ПО КОМАНДЕ 0 ===
+            # === ЗАВЕРШЕНИЕ КАЛИБРОВОК 100/101/102/105/107/108 ПО КОМАНДЕ 0 ===
             # При переходе CMD -> 0 завершаем калибровку: рассчитываем результаты и записываем их
             elif current_state_value == "CALIBRATE_WALL" and new_cmd == 0:
                 print(" [CALIBRATE_WALL→0] Завершение калибровки стенки, расчет результатов...")
@@ -890,6 +1090,14 @@ class LaserGeometrySystem:
             elif current_state_value == "CALIBRATE_FLANGE_DIAMETER" and new_cmd == 0:
                 print(" [CALIBRATE_FLANGE_DIAMETER→0] Завершение калибровки диаметра фланца, расчет результатов...")
                 self._finish_calibration_flange_diameter()
+                return
+            elif current_state_value == "CALIBRATE_BODY_DIAMETER_SEPARATE" and new_cmd == 0:
+                print(" [CALIBRATE_BODY_DIAMETER_SEPARATE→0] Завершение калибровки диаметра корпуса (раздельно), расчет результатов...")
+                self._finish_calibration_body_diameter_separate()
+                return
+            elif current_state_value == "CALIBRATE_BODY2_DIAMETER" and new_cmd == 0:
+                print(" [CALIBRATE_BODY2_DIAMETER→0] Завершение калибровки диаметра корпуса 2, расчет результатов...")
+                self._finish_calibration_body2_diameter()
                 return
             
             # === ПРЕРЫВАНИЕ ЦИКЛА (ОШИБКИ) ===
@@ -1203,6 +1411,19 @@ class LaserGeometrySystem:
                     'check_type': 'two_sided'  # двусторонняя проверка
                 }
             ]
+
+            # Диаметр корпуса 2 оцениваем только если в цикле была команда 40
+            if self.body2_quality_required:
+                parameters.append(
+                    {
+                        'name': 'body_diameter_2',
+                        'measured_regs': [(30059, 30060), (30061, 30062), (30063, 30064)],
+                        'base_regs': (40346, 40347),
+                        'cond_bad_regs': (40348, 40349),
+                        'bad_regs': (40350, 40351),
+                        'check_type': 'one_sided'
+                    }
+                )
             
             # Проверяем каждый параметр
             for param in parameters:
@@ -2230,6 +2451,16 @@ class LaserGeometrySystem:
         self.temp_sensor1_bottom_buffer = []
         self.temp_sensor2_bottom_buffer = []
         self.bottom_wall_thickness_buffer = []
+
+        # Буферы раздельных команд диаметров (20/30/40)
+        self.sensor3_flange_only_measurements = []
+        self.sensor3_body_only_measurements = []
+        self.sensor3_body2_measurements = []
+        self.temp_sensor3_flange_only_buffer = []
+        self.temp_sensor3_body_only_buffer = []
+        self.temp_sensor3_body2_buffer = []
+        self.body_only_diameter_buffer = []
+        self.body2_diameter_buffer = []
         
         # Буферы QUAD потокового режима (CMD=200)
         self.stream_temp_sensor1_buffer = []
@@ -2265,6 +2496,10 @@ class LaserGeometrySystem:
             self.handle_calibrate_height_state()
         elif self.current_state == SystemState.CALIBRATE_FLANGE_DIAMETER:
             self.handle_calibrate_flange_diameter_state()
+        elif self.current_state == SystemState.CALIBRATE_BODY_DIAMETER_SEPARATE:
+            self.handle_calibrate_body_diameter_separate_state()
+        elif self.current_state == SystemState.CALIBRATE_BODY2_DIAMETER:
+            self.handle_calibrate_body2_diameter_state()
         elif self.current_state == SystemState.CONFIGURE_SENSOR3_RANGE:
             self.handle_configure_sensor3_range_state()
         elif self.current_state == SystemState.DEBUG_REGISTERS:
@@ -2286,6 +2521,18 @@ class LaserGeometrySystem:
             self.handle_measure_flange_process_state()
         elif self.current_state == SystemState.MEASURE_FLANGE_CALCULATE:
             self.handle_calculate_flange_state()
+        elif self.current_state == SystemState.MEASURE_FLANGE_ONLY_PROCESS:
+            self.handle_measure_flange_only_process_state()
+        elif self.current_state == SystemState.MEASURE_FLANGE_ONLY_CALCULATE:
+            self.handle_calculate_flange_only_state()
+        elif self.current_state == SystemState.MEASURE_BODY_ONLY_PROCESS:
+            self.handle_measure_body_only_process_state()
+        elif self.current_state == SystemState.MEASURE_BODY_ONLY_CALCULATE:
+            self.handle_calculate_body_only_state()
+        elif self.current_state == SystemState.MEASURE_BODY2_PROCESS:
+            self.handle_measure_body2_process_state()
+        elif self.current_state == SystemState.MEASURE_BODY2_CALCULATE:
+            self.handle_calculate_body2_state()
             
         # Основной цикл измерения - нижняя стенка
         elif self.current_state == SystemState.MEASURE_BOTTOM_PROCESS:
@@ -2528,6 +2775,200 @@ class LaserGeometrySystem:
         except Exception as e:
             print(f" [CMD=105] Ошибка чтения эталонного диаметра фланца: {e}")
         return 0.0
+
+    def handle_calibrate_body_diameter_separate_state(self):
+        """
+        CMD=107: Калибровка раздельного диаметра корпуса
+        - Читаем эталонный диаметр из регистров 40034-40035
+        - Непрерывно собираем данные от датчика 3 до получения CMD=0
+        - Расчет и запись выполняются при переходе CMD -> 0
+        """
+        if not self.sensors:
+            self.finalize_calibration_failure(
+                107,
+                " [CMD=107] Ошибка: датчики не подключены!",
+                cleanup_flags=['calibrate_body_diameter_separate_started'],
+                register_doublewords=[40038],
+                cache_attrs=['cached_distance_sensor3_to_center_body'],
+            )
+            return
+
+        try:
+            if not hasattr(self, 'calibrate_body_diameter_separate_started'):
+                self.calibration_in_progress = True
+                self.calibrate_body_diameter_separate_started = True
+                self.calibrate_body_diameter_separate_sensor3_buffer = []
+                self.calibrate_body_diameter_separate_measurement_count = 0
+                self.calibrate_body_diameter_separate_last_log_time = time.time()
+
+                self.clear_serial_buffers()
+                self.flush_sensor_queue()
+                self.measurement_buffer['sensor3'].clear()
+
+                reference_body_diameter = self.read_reference_body_diameter_separate()
+                print("🔧 НАЧАЛО КАЛИБРОВКИ РАЗДЕЛЬНОГО ДИАМЕТРА КОРПУСА (CMD=107)")
+                print(f" [CMD=107] Эталонный диаметр: {reference_body_diameter:.3f} мм")
+
+                if reference_body_diameter <= 0:
+                    self.finalize_calibration_failure(
+                        107,
+                        " [CMD=107] ОШИБКА: Эталонный диаметр должен быть больше 0!",
+                        cleanup_flags=['calibrate_body_diameter_separate_started'],
+                        register_doublewords=[40038],
+                        cache_attrs=['cached_distance_sensor3_to_center_body'],
+                    )
+                    return
+
+                self.write_cycle_flag(107)
+                print(" [CMD=107] Непрерывный сбор данных от датчика 3...")
+
+            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+            if sensor3_mm is None:
+                time.sleep(0.002)
+                return
+
+            if self.is_valid_measurement(sensor3_mm):
+                self.measurement_buffer['sensor3'].append(sensor3_mm)
+                self.calibrate_body_diameter_separate_sensor3_buffer.append(sensor3_mm)
+                self.calibrate_body_diameter_separate_measurement_count += 1
+
+            current_time = time.time()
+            if current_time - getattr(self, 'calibrate_body_diameter_separate_last_log_time', 0) >= 1.0:
+                print(f" [CMD=107] Сбор данных... Измерений датчика 3: {self.calibrate_body_diameter_separate_measurement_count}")
+                self.calibrate_body_diameter_separate_last_log_time = current_time
+
+        except Exception as e:
+            print(f" [CMD=107] Ошибка калибровки раздельного диаметра корпуса: {e}")
+            import traceback
+            traceback.print_exc()
+            self.finalize_calibration_failure(
+                107,
+                f" [CMD=107] Ошибка калибровки: {e}",
+                cleanup_flags=['calibrate_body_diameter_separate_started'],
+                register_doublewords=[40038],
+                cache_attrs=['cached_distance_sensor3_to_center_body'],
+            )
+
+    def handle_calibrate_body2_diameter_state(self):
+        """
+        CMD=108: Калибровка диаметра корпуса 2
+        - Читаем эталонный диаметр из регистров 40036-40037
+        - Непрерывно собираем данные от датчика 3 до получения CMD=0
+        - Расчет и запись выполняются при переходе CMD -> 0
+        """
+        if not self.sensors:
+            self.finalize_calibration_failure(
+                108,
+                " [CMD=108] Ошибка: датчики не подключены!",
+                cleanup_flags=['calibrate_body2_diameter_started'],
+                register_doublewords=[40040],
+                cache_attrs=['cached_distance_sensor3_to_center_body2'],
+            )
+            return
+
+        try:
+            if not hasattr(self, 'calibrate_body2_diameter_started'):
+                self.calibration_in_progress = True
+                self.calibrate_body2_diameter_started = True
+                self.calibrate_body2_diameter_sensor3_buffer = []
+                self.calibrate_body2_diameter_measurement_count = 0
+                self.calibrate_body2_diameter_last_log_time = time.time()
+
+                self.clear_serial_buffers()
+                self.flush_sensor_queue()
+                self.measurement_buffer['sensor3'].clear()
+
+                reference_body2_diameter = self.read_reference_body2_diameter()
+                print("🔧 НАЧАЛО КАЛИБРОВКИ ДИАМЕТРА КОРПУСА 2 (CMD=108)")
+                print(f" [CMD=108] Эталонный диаметр: {reference_body2_diameter:.3f} мм")
+
+                if reference_body2_diameter <= 0:
+                    self.finalize_calibration_failure(
+                        108,
+                        " [CMD=108] ОШИБКА: Эталонный диаметр должен быть больше 0!",
+                        cleanup_flags=['calibrate_body2_diameter_started'],
+                        register_doublewords=[40040],
+                        cache_attrs=['cached_distance_sensor3_to_center_body2'],
+                    )
+                    return
+
+                self.write_cycle_flag(108)
+                print(" [CMD=108] Непрерывный сбор данных от датчика 3...")
+
+            sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+            if sensor3_mm is None:
+                time.sleep(0.002)
+                return
+
+            if self.is_valid_measurement(sensor3_mm):
+                self.measurement_buffer['sensor3'].append(sensor3_mm)
+                self.calibrate_body2_diameter_sensor3_buffer.append(sensor3_mm)
+                self.calibrate_body2_diameter_measurement_count += 1
+
+            current_time = time.time()
+            if current_time - getattr(self, 'calibrate_body2_diameter_last_log_time', 0) >= 1.0:
+                print(f" [CMD=108] Сбор данных... Измерений датчика 3: {self.calibrate_body2_diameter_measurement_count}")
+                self.calibrate_body2_diameter_last_log_time = current_time
+
+        except Exception as e:
+            print(f" [CMD=108] Ошибка калибровки диаметра корпуса 2: {e}")
+            import traceback
+            traceback.print_exc()
+            self.finalize_calibration_failure(
+                108,
+                f" [CMD=108] Ошибка калибровки: {e}",
+                cleanup_flags=['calibrate_body2_diameter_started'],
+                register_doublewords=[40040],
+                cache_attrs=['cached_distance_sensor3_to_center_body2'],
+            )
+
+    def read_reference_body_diameter_separate(self) -> float:
+        """Чтение эталонного диаметра корпуса (раздельно) из регистров 40034, 40035"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                values = self.modbus_server.slave_context.getValues(3, 34, 2)  # 40034-40035
+                if values and len(values) >= 2:
+                    high_word = int(values[0])
+                    low_word = int(values[1])
+                    return self.doubleword_to_float(low_word, high_word)
+        except Exception as e:
+            print(f" [CMD=107] Ошибка чтения эталонного диаметра: {e}")
+        return 0.0
+
+    def read_reference_body2_diameter(self) -> float:
+        """Чтение эталонного диаметра корпуса 2 из регистров 40036, 40037"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                values = self.modbus_server.slave_context.getValues(3, 36, 2)  # 40036-40037
+                if values and len(values) >= 2:
+                    high_word = int(values[0])
+                    low_word = int(values[1])
+                    return self.doubleword_to_float(low_word, high_word)
+        except Exception as e:
+            print(f" [CMD=108] Ошибка чтения эталонного диаметра: {e}")
+        return 0.0
+
+    def write_distance_sensor3_to_center_body(self, distance: float):
+        """Запись расстояния датчик 3 - центр для раздельного диаметра корпуса в 40038-40039"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                low_word, high_word = self.float_to_doubleword(distance)
+                self.modbus_server.slave_context.setValues(3, 38, [int(high_word)])
+                self.modbus_server.slave_context.setValues(3, 39, [int(low_word)])
+                print(f" [CMD=107] Записано расстояние 40038-40039: {distance:.3f} мм")
+        except Exception as e:
+            print(f" [CMD=107] Ошибка записи расстояния 40038-40039: {e}")
+
+    def write_distance_sensor3_to_center_body2(self, distance: float):
+        """Запись расстояния датчик 3 - центр для диаметра корпуса 2 в 40040-40041"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                low_word, high_word = self.float_to_doubleword(distance)
+                self.modbus_server.slave_context.setValues(3, 40, [int(high_word)])
+                self.modbus_server.slave_context.setValues(3, 41, [int(low_word)])
+                print(f" [CMD=108] Записано расстояние 40040-40041: {distance:.3f} мм")
+        except Exception as e:
+            print(f" [CMD=108] Ошибка записи расстояния 40040-40041: {e}")
     
     def handle_configure_sensor3_range_state(self):
         """
@@ -2810,6 +3251,14 @@ class LaserGeometrySystem:
     def read_bottom_thickness_extrapolation_coeff(self) -> float:
         """Коэффициент экстраполяции толщины дна (40519-40520)"""
         return self._read_offset_coeff(518)  # 40519 - 40000 = 519
+
+    def read_body2_diameter_extrapolation_coeff(self) -> float:
+        """Коэффициент экстраполяции диаметра корпуса 2 (40521-40522)"""
+        return self._read_offset_coeff(520)
+
+    def read_body2_diameter_offset_coeff(self) -> float:
+        """Коэффициент смещения диаметра корпуса 2 (40522-40523)"""
+        return self._read_offset_coeff(522)
 
     def _read_offset_coeff(self, base_index: int) -> float:
         """Общий метод чтения коэффициента смещения"""
@@ -3481,6 +3930,124 @@ class LaserGeometrySystem:
                 register_doublewords=[40032],
                 cache_attrs=['cached_distance_sensor3_to_center'],
             )
+
+    def _finish_calibration_body_diameter_separate(self):
+        """Завершение калибровки раздельного диаметра корпуса (CMD=107)"""
+        try:
+            if not hasattr(self, 'calibrate_body_diameter_separate_started'):
+                self.finalize_calibration_failure(
+                    107,
+                    " [CMD=107] ОШИБКА: Калибровка не была инициализирована!",
+                    cleanup_flags=['calibrate_body_diameter_separate_started'],
+                    register_doublewords=[40038],
+                    cache_attrs=['cached_distance_sensor3_to_center_body'],
+                )
+                return
+
+            if (not hasattr(self, 'calibrate_body_diameter_separate_sensor3_buffer') or
+                len(self.calibrate_body_diameter_separate_sensor3_buffer) == 0):
+                self.finalize_calibration_failure(
+                    107,
+                    " [CMD=107] ОШИБКА: Недостаточно данных для расчета!",
+                    cleanup_flags=['calibrate_body_diameter_separate_started'],
+                    register_doublewords=[40038],
+                    cache_attrs=['cached_distance_sensor3_to_center_body'],
+                )
+                return
+
+            avg_sensor3 = sum(self.calibrate_body_diameter_separate_sensor3_buffer) / len(self.calibrate_body_diameter_separate_sensor3_buffer)
+            reference_diameter = self.read_reference_body_diameter_separate()
+            distance_sensor3_to_center = (reference_diameter / 2) + avg_sensor3
+
+            print(f" [CMD=107] Среднее датчика 3: {avg_sensor3:.3f} мм")
+            print(f" [CMD=107] Расстояние датчик 3 - центр: {distance_sensor3_to_center:.3f} мм")
+
+            self.write_distance_sensor3_to_center_body(distance_sensor3_to_center)
+            self.cached_distance_sensor3_to_center_body = distance_sensor3_to_center
+
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
+
+            for attr in [
+                'calibrate_body_diameter_separate_started',
+                'calibrate_body_diameter_separate_sensor3_buffer',
+                'calibrate_body_diameter_separate_measurement_count',
+                'calibrate_body_diameter_separate_last_log_time',
+            ]:
+                if hasattr(self, attr):
+                    delattr(self, attr)
+
+            self.calibration_in_progress = False
+            self.write_cycle_flag(0)
+            print(" [CMD=107] КАЛИБРОВКА РАЗДЕЛЬНОГО ДИАМЕТРА КОРПУСА ЗАВЕРШЕНА УСПЕШНО")
+
+        except Exception as e:
+            self.finalize_calibration_failure(
+                107,
+                f" [CMD=107] Ошибка завершения калибровки: {e}",
+                cleanup_flags=['calibrate_body_diameter_separate_started'],
+                register_doublewords=[40038],
+                cache_attrs=['cached_distance_sensor3_to_center_body'],
+            )
+
+    def _finish_calibration_body2_diameter(self):
+        """Завершение калибровки диаметра корпуса 2 (CMD=108)"""
+        try:
+            if not hasattr(self, 'calibrate_body2_diameter_started'):
+                self.finalize_calibration_failure(
+                    108,
+                    " [CMD=108] ОШИБКА: Калибровка не была инициализирована!",
+                    cleanup_flags=['calibrate_body2_diameter_started'],
+                    register_doublewords=[40040],
+                    cache_attrs=['cached_distance_sensor3_to_center_body2'],
+                )
+                return
+
+            if (not hasattr(self, 'calibrate_body2_diameter_sensor3_buffer') or
+                len(self.calibrate_body2_diameter_sensor3_buffer) == 0):
+                self.finalize_calibration_failure(
+                    108,
+                    " [CMD=108] ОШИБКА: Недостаточно данных для расчета!",
+                    cleanup_flags=['calibrate_body2_diameter_started'],
+                    register_doublewords=[40040],
+                    cache_attrs=['cached_distance_sensor3_to_center_body2'],
+                )
+                return
+
+            avg_sensor3 = sum(self.calibrate_body2_diameter_sensor3_buffer) / len(self.calibrate_body2_diameter_sensor3_buffer)
+            reference_diameter = self.read_reference_body2_diameter()
+            distance_sensor3_to_center = (reference_diameter / 2) + avg_sensor3
+
+            print(f" [CMD=108] Среднее датчика 3: {avg_sensor3:.3f} мм")
+            print(f" [CMD=108] Расстояние датчик 3 - центр: {distance_sensor3_to_center:.3f} мм")
+
+            self.write_distance_sensor3_to_center_body2(distance_sensor3_to_center)
+            self.cached_distance_sensor3_to_center_body2 = distance_sensor3_to_center
+
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
+
+            for attr in [
+                'calibrate_body2_diameter_started',
+                'calibrate_body2_diameter_sensor3_buffer',
+                'calibrate_body2_diameter_measurement_count',
+                'calibrate_body2_diameter_last_log_time',
+            ]:
+                if hasattr(self, attr):
+                    delattr(self, attr)
+
+            self.calibration_in_progress = False
+            self.write_cycle_flag(0)
+            print(" [CMD=108] КАЛИБРОВКА ДИАМЕТРА КОРПУСА 2 ЗАВЕРШЕНА УСПЕШНО")
+
+        except Exception as e:
+            self.finalize_calibration_failure(
+                108,
+                f" [CMD=108] Ошибка завершения калибровки: {e}",
+                cleanup_flags=['calibrate_body2_diameter_started'],
+                register_doublewords=[40040],
+                cache_attrs=['cached_distance_sensor3_to_center_body2'],
+            )
     
     def read_reference_thickness(self) -> float:
         """Чтение толщины эталона из регистров 40002, 40003"""
@@ -4002,6 +4569,32 @@ class LaserGeometrySystem:
         except Exception as e:
             print(f" Ошибка чтения расстояния датчика 3 до центра: {e}")
         return None
+
+    def read_calibrated_distance_sensor3_to_center_body(self) -> float:
+        """Чтение калиброванного расстояния датчика 3 до центра (раздельный диаметр корпуса) из 40038-40039"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                values = self.modbus_server.slave_context.getValues(3, 38, 2)  # 40038-40039
+                if values and len(values) >= 2:
+                    high_word = int(values[0])
+                    low_word = int(values[1])
+                    return self.doubleword_to_float(low_word, high_word)
+        except Exception as e:
+            print(f" Ошибка чтения расстояния датчика 3 до центра (раздельный корпус): {e}")
+        return None
+
+    def read_calibrated_distance_sensor3_to_center_body2(self) -> float:
+        """Чтение калиброванного расстояния датчика 3 до центра (корпус 2) из 40040-40041"""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                values = self.modbus_server.slave_context.getValues(3, 40, 2)  # 40040-40041
+                if values and len(values) >= 2:
+                    high_word = int(values[0])
+                    low_word = int(values[1])
+                    return self.doubleword_to_float(low_word, high_word)
+        except Exception as e:
+            print(f" Ошибка чтения расстояния датчика 3 до центра (корпус 2): {e}")
+        return None
     
     def apply_extrapolation_to_buffer(self, buffer: list, extrapolation_coeff: float) -> list:
         """
@@ -4316,6 +4909,140 @@ class LaserGeometrySystem:
                 
         except Exception as e:
             print(f" Ошибка записи результатов измерения фланца: {e}")
+
+    def calculate_diameter_stats_from_radii(self, radii_buffer: list, extrapolation_coeff: float, offset_coeff: float, label: str):
+        """Расчёт max/avg/min диаметра по буферу радиусов"""
+        valid_radii = [r for r in radii_buffer if r is not None and r > 0 and not (math.isnan(r) or math.isinf(r))]
+        if len(valid_radii) == 0:
+            print(f" ОШИБКА: Нет валидных значений радиуса ({label})!")
+            return None
+
+        if abs(extrapolation_coeff) > 0.0001:
+            valid_radii = self.apply_extrapolation_to_buffer(valid_radii, extrapolation_coeff)
+            print(f" [ЭКСТРАПОЛЯЦИЯ] {label}: применен коэффициент {extrapolation_coeff:.6f}")
+
+        if len(valid_radii) >= 2:
+            total_measurements = len(valid_radii)
+            half_size = total_measurements // 2
+            opposite_diameters = []
+            for i in range(half_size):
+                diameter_val = valid_radii[i] + valid_radii[i + half_size] + offset_coeff
+                opposite_diameters.append(diameter_val)
+
+            if len(opposite_diameters) > 0:
+                max_val = max(opposite_diameters)
+                min_val = min(opposite_diameters)
+                avg_val = sum(opposite_diameters) / len(opposite_diameters)
+            else:
+                max_val = max(valid_radii) * 2 + offset_coeff
+                min_val = min(valid_radii) * 2 + offset_coeff
+                avg_val = (sum(valid_radii) / len(valid_radii)) * 2 + offset_coeff
+        else:
+            max_val = max(valid_radii) * 2 + offset_coeff
+            min_val = min(valid_radii) * 2 + offset_coeff
+            avg_val = (sum(valid_radii) / len(valid_radii)) * 2 + offset_coeff
+
+        return max_val, avg_val, min_val
+
+    def process_flange_only_measurement_results(self):
+        """Подсчёт результатов раздельного измерения фланца и толщины дна (CMD=21)"""
+        if len(self.flange_diameter_buffer) == 0:
+            print(" Ошибка: нет данных раздельного измерения фланца")
+            return
+        if len(self.bottom_thickness_buffer) == 0:
+            print(" Ошибка: нет данных раздельного измерения толщины дна")
+            return
+
+        flange_stats = self.calculate_diameter_stats_from_radii(
+            self.flange_diameter_buffer,
+            self.read_flange_diameter_extrapolation_coeff(),
+            self.read_flange_diameter_offset_coeff(),
+            "фланец (раздельно)"
+        )
+        if not flange_stats:
+            return
+        max_flange, avg_flange, min_flange = flange_stats
+
+        bottom_extrapolation_coeff = self.read_bottom_thickness_extrapolation_coeff()
+        if abs(bottom_extrapolation_coeff) > 0.0001:
+            extrapolated_bottom = self.apply_extrapolation_to_buffer(self.bottom_thickness_buffer, bottom_extrapolation_coeff)
+            print(f" [ЭКСТРАПОЛЯЦИЯ] Толщина дна (раздельно): применен коэффициент {bottom_extrapolation_coeff:.6f}")
+        else:
+            extrapolated_bottom = self.bottom_thickness_buffer
+
+        max_bottom = max(extrapolated_bottom)
+        avg_bottom = sum(extrapolated_bottom) / len(extrapolated_bottom)
+        min_bottom = min(extrapolated_bottom)
+
+        self.write_flange_only_measurement_results(
+            max_flange, avg_flange, min_flange,
+            max_bottom, avg_bottom, min_bottom
+        )
+        print(f" Результаты раздельного фланца: макс={max_flange:.3f}, сред={avg_flange:.3f}, мин={min_flange:.3f}")
+        print(f" Результаты толщины дна (раздельно): макс={max_bottom:.3f}, сред={avg_bottom:.3f}, мин={min_bottom:.3f}")
+
+    def process_body_only_measurement_results(self):
+        """Подсчёт результатов раздельного диаметра корпуса (CMD=31)"""
+        if len(self.body_only_diameter_buffer) == 0:
+            print(" Ошибка: нет данных раздельного измерения диаметра корпуса")
+            return
+
+        stats = self.calculate_diameter_stats_from_radii(
+            self.body_only_diameter_buffer,
+            self.read_body_diameter_extrapolation_coeff(),
+            self.read_body_diameter_offset_coeff(),
+            "корпус (раздельно)"
+        )
+        if not stats:
+            return
+        max_val, avg_val, min_val = stats
+        self.write_body_only_measurement_results(max_val, avg_val, min_val)
+        print(f" Результаты раздельного диаметра корпуса: макс={max_val:.3f}, сред={avg_val:.3f}, мин={min_val:.3f}")
+
+    def process_body2_measurement_results(self):
+        """Подсчёт результатов диаметра корпуса 2 (CMD=41)"""
+        if len(self.body2_diameter_buffer) == 0:
+            print(" Ошибка: нет данных измерения диаметра корпуса 2")
+            return
+
+        stats = self.calculate_diameter_stats_from_radii(
+            self.body2_diameter_buffer,
+            self.read_body2_diameter_extrapolation_coeff(),
+            self.read_body2_diameter_offset_coeff(),
+            "корпус 2"
+        )
+        if not stats:
+            return
+        max_val, avg_val, min_val = stats
+        self.write_body2_measurement_results(max_val, avg_val, min_val)
+        print(f" Результаты диаметра корпуса 2: макс={max_val:.3f}, сред={avg_val:.3f}, мин={min_val:.3f}")
+
+    def write_flange_only_measurement_results(
+        self,
+        max_flange: float, avg_flange: float, min_flange: float,
+        max_bottom: float, avg_bottom: float, min_bottom: float
+    ):
+        """Запись результатов раздельного измерения фланца и толщины дна"""
+        # Диаметр фланца → 30052-30057
+        self.write_stream_result_to_input_registers(max_flange, 30054)
+        self.write_stream_result_to_input_registers(avg_flange, 30052)
+        self.write_stream_result_to_input_registers(min_flange, 30056)
+        # Толщина дна → 30028-30033
+        self.write_stream_result_to_input_registers(max_bottom, 30028)
+        self.write_stream_result_to_input_registers(avg_bottom, 30030)
+        self.write_stream_result_to_input_registers(min_bottom, 30032)
+
+    def write_body_only_measurement_results(self, max_val: float, avg_val: float, min_val: float):
+        """Запись результатов раздельного измерения диаметра корпуса в 30046-30051"""
+        self.write_stream_result_to_input_registers(max_val, 30046)
+        self.write_stream_result_to_input_registers(avg_val, 30048)
+        self.write_stream_result_to_input_registers(min_val, 30050)
+
+    def write_body2_measurement_results(self, max_val: float, avg_val: float, min_val: float):
+        """Запись результатов диаметра корпуса 2 в 30059-30064"""
+        self.write_stream_result_to_input_registers(max_val, 30059)
+        self.write_stream_result_to_input_registers(avg_val, 30061)
+        self.write_stream_result_to_input_registers(min_val, 30063)
     
     def process_bottom_wall_measurement_results(self):
         """Обработка результатов измерения нижней стенки при переходе 12→0"""
@@ -4936,6 +5663,199 @@ class LaserGeometrySystem:
             
         except Exception as e:
             print(f" Ошибка подсчёта результатов фланца: {e}")
+            self.current_state = SystemState.ERROR
+
+    def collect_sensor3_radius_measurement(self, temp_buffer: list, radii_buffer: list, distance_to_center: float, cmd_label: str):
+        """Сбор и фильтрация радиуса по датчику 3 с усреднением по 10 измерений"""
+        sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+        if sensor3_mm is None:
+            time.sleep(0.001)
+            return
+
+        self.frequency_counter += 1
+        current_time = time.time()
+        if self.frequency_start_time is not None and current_time - self.last_frequency_display >= 1.0:
+            elapsed = current_time - self.frequency_start_time
+            if elapsed > 0:
+                instant_freq = self.frequency_counter / elapsed
+                print(f" [{cmd_label}] Частота опроса: {instant_freq:.1f} Гц | Измерений: {self.frequency_counter}")
+            self.last_frequency_display = current_time
+
+        if not self.is_valid_measurement(sensor3_mm):
+            return
+
+        temp_buffer.append(sensor3_mm)
+        if len(temp_buffer) < 10:
+            return
+
+        sorted_sensor3 = sorted(temp_buffer)
+        median_sensor3 = (sorted_sensor3[4] + sorted_sensor3[5]) / 2.0
+        filtered_sensor3 = [v for v in temp_buffer if abs(v - median_sensor3) <= 1.5]
+        if len(filtered_sensor3) >= 5:
+            avg_sensor3 = sum(filtered_sensor3) / len(filtered_sensor3)
+        else:
+            avg_sensor3 = median_sensor3
+
+        radius = distance_to_center - avg_sensor3
+        radii_buffer.append(radius)
+        temp_buffer.clear()
+
+    def collect_flange_and_bottom_measurement(self):
+        """Сбор данных для CMD=20: диаметр фланца (датчик 3) и толщина дна (датчик 4)"""
+        sensor1_mm, sensor2_mm, sensor3_mm, sensor4_mm = self.read_sensors_safe()
+        if sensor3_mm is None or sensor4_mm is None:
+            time.sleep(0.001)
+            return
+
+        self.frequency_counter += 1
+        current_time = time.time()
+        if self.frequency_start_time is not None and current_time - self.last_frequency_display >= 1.0:
+            elapsed = current_time - self.frequency_start_time
+            if elapsed > 0:
+                instant_freq = self.frequency_counter / elapsed
+                print(f" [CMD=20] Частота опроса: {instant_freq:.1f} Гц | Измерений: {self.frequency_counter}")
+            self.last_frequency_display = current_time
+
+        if not (self.is_valid_measurement(sensor3_mm) and self.is_valid_measurement(sensor4_mm)):
+            return
+
+        self.temp_sensor3_flange_only_buffer.append(sensor3_mm)
+        self.temp_sensor4_buffer.append(sensor4_mm)
+        if len(self.temp_sensor3_flange_only_buffer) < 10:
+            return
+
+        sorted_sensor3 = sorted(self.temp_sensor3_flange_only_buffer)
+        sorted_sensor4 = sorted(self.temp_sensor4_buffer)
+        median_sensor3 = (sorted_sensor3[4] + sorted_sensor3[5]) / 2.0
+        median_sensor4 = (sorted_sensor4[4] + sorted_sensor4[5]) / 2.0
+
+        filtered_sensor3 = [v for v in self.temp_sensor3_flange_only_buffer if abs(v - median_sensor3) <= 1.5]
+        filtered_sensor4 = [v for v in self.temp_sensor4_buffer if abs(v - median_sensor4) <= 1.5]
+
+        if len(filtered_sensor3) >= 5:
+            avg_sensor3 = sum(filtered_sensor3) / len(filtered_sensor3)
+        else:
+            avg_sensor3 = median_sensor3
+
+        if len(filtered_sensor4) >= 5:
+            avg_sensor4 = sum(filtered_sensor4) / len(filtered_sensor4)
+        else:
+            avg_sensor4 = median_sensor4
+
+        flange_radius = self.cached_distance_sensor3_to_center - avg_sensor3
+        bottom_thickness = self.cached_distance_sensor4 - avg_sensor4 + self.read_bottom_thickness_offset_coeff()
+        self.flange_diameter_buffer.append(flange_radius)
+        self.bottom_thickness_buffer.append(bottom_thickness)
+
+        self.temp_sensor3_flange_only_buffer.clear()
+        self.temp_sensor4_buffer.clear()
+
+    def handle_measure_flange_only_process_state(self):
+        """CMD=20: Раздельный сбор данных диаметра фланца и толщины дна"""
+        if not hasattr(self, '_flange_only_measurement_started'):
+            self._flange_only_measurement_started = True
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
+            self.frequency_counter = 0
+            self.frequency_start_time = time.time()
+            self.last_frequency_display = self.frequency_start_time
+            self.cached_distance_sensor3_to_center = self.read_calibrated_distance_sensor3_to_center()
+            self.cached_distance_sensor4 = self.read_calibrated_distance_sensor4()
+            print(" [CMD=20] Буферы очищены, старт раздельного измерения фланца и толщины дна")
+
+        if self.cached_distance_sensor3_to_center is None:
+            print(" [CMD=20] Ошибка: нет калиброванного расстояния датчик3-центр для фланца")
+            return
+        if self.cached_distance_sensor4 is None:
+            print(" [CMD=20] Ошибка: нет калиброванного расстояния датчика 4 для толщины дна")
+            return
+
+        self.collect_flange_and_bottom_measurement()
+
+    def handle_calculate_flange_only_state(self):
+        """CMD=21: Подсчёт раздельного диаметра фланца"""
+        try:
+            if not self.flange_only_calculated:
+                print(" [CMD=21] Подсчёт раздельного диаметра фланца...")
+                self.process_flange_only_measurement_results()
+                self.write_cycle_flag(212)
+                self.flange_only_calculated = True
+                print(" [STATUS=212] Подсчёт раздельного фланца завершён")
+        except Exception as e:
+            print(f" Ошибка подсчёта раздельного диаметра фланца: {e}")
+            self.current_state = SystemState.ERROR
+
+    def handle_measure_body_only_process_state(self):
+        """CMD=30: Раздельный сбор данных диаметра корпуса"""
+        if not hasattr(self, '_body_only_measurement_started'):
+            self._body_only_measurement_started = True
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
+            self.frequency_counter = 0
+            self.frequency_start_time = time.time()
+            self.last_frequency_display = self.frequency_start_time
+            self.cached_distance_sensor3_to_center_body = self.read_calibrated_distance_sensor3_to_center_body()
+            print(" [CMD=30] Буферы очищены, старт раздельного измерения диаметра корпуса")
+
+        if self.cached_distance_sensor3_to_center_body is None:
+            print(" [CMD=30] Ошибка: нет калиброванного расстояния датчик3-центр (раздельный корпус)")
+            return
+
+        self.collect_sensor3_radius_measurement(
+            self.temp_sensor3_body_only_buffer,
+            self.body_only_diameter_buffer,
+            self.cached_distance_sensor3_to_center_body,
+            "CMD=30",
+        )
+
+    def handle_calculate_body_only_state(self):
+        """CMD=31: Подсчёт раздельного диаметра корпуса"""
+        try:
+            if not self.body_only_calculated:
+                print(" [CMD=31] Подсчёт раздельного диаметра корпуса...")
+                self.process_body_only_measurement_results()
+                self.write_cycle_flag(312)
+                self.body_only_calculated = True
+                print(" [STATUS=312] Подсчёт раздельного диаметра корпуса завершён")
+        except Exception as e:
+            print(f" Ошибка подсчёта раздельного диаметра корпуса: {e}")
+            self.current_state = SystemState.ERROR
+
+    def handle_measure_body2_process_state(self):
+        """CMD=40: Сбор данных диаметра корпуса 2"""
+        if not hasattr(self, '_body2_measurement_started'):
+            self._body2_measurement_started = True
+            self.clear_measurement_buffers()
+            self.clear_serial_buffers()
+            self.frequency_counter = 0
+            self.frequency_start_time = time.time()
+            self.last_frequency_display = self.frequency_start_time
+            self.cached_distance_sensor3_to_center_body2 = self.read_calibrated_distance_sensor3_to_center_body2()
+            self.body2_quality_required = True
+            print(" [CMD=40] Буферы очищены, старт измерения диаметра корпуса 2")
+
+        if self.cached_distance_sensor3_to_center_body2 is None:
+            print(" [CMD=40] Ошибка: нет калиброванного расстояния датчик3-центр (корпус 2)")
+            return
+
+        self.collect_sensor3_radius_measurement(
+            self.temp_sensor3_body2_buffer,
+            self.body2_diameter_buffer,
+            self.cached_distance_sensor3_to_center_body2,
+            "CMD=40",
+        )
+
+    def handle_calculate_body2_state(self):
+        """CMD=41: Подсчёт диаметра корпуса 2"""
+        try:
+            if not self.body2_calculated:
+                print(" [CMD=41] Подсчёт диаметра корпуса 2...")
+                self.process_body2_measurement_results()
+                self.write_cycle_flag(412)
+                self.body2_calculated = True
+                print(" [STATUS=412] Подсчёт диаметра корпуса 2 завершён")
+        except Exception as e:
+            print(f" Ошибка подсчёта диаметра корпуса 2: {e}")
             self.current_state = SystemState.ERROR
     
     def handle_measure_bottom_process_state(self):
