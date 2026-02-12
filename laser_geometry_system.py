@@ -3257,7 +3257,7 @@ class LaserGeometrySystem:
         return self._read_offset_coeff(520)
 
     def read_body2_diameter_offset_coeff(self) -> float:
-        """Коэффициент смещения диаметра корпуса 2 (40522-40523)"""
+        """Коэффициент смещения диаметра корпуса 2 (40523-40524)"""
         return self._read_offset_coeff(522)
 
     def _read_offset_coeff(self, base_index: int) -> float:
@@ -3728,9 +3728,9 @@ class LaserGeometrySystem:
                 )
                 return
             
-            # Усредняем измерения датчика 4
-            avg_sensor4 = sum(self.calibrate_bottom_sensor4_buffer) / len(self.calibrate_bottom_sensor4_buffer)
-            print(f" [CMD=101] Среднее значение датчика 4: {avg_sensor4:.3f} мм (из {len(self.calibrate_bottom_sensor4_buffer)} измерений)")
+            # Усеченное среднее в диапазоне [P5..P95]
+            _, avg_sensor4, _ = self.calculate_robust_stats(self.calibrate_bottom_sensor4_buffer)
+            print(f" [CMD=101] Усеченное среднее (P5..P95) датчика 4: {avg_sensor4:.3f} мм (из {len(self.calibrate_bottom_sensor4_buffer)} измерений)")
             
             # Вычисляем расстояние от датчика 4 до поверхности
             reference_bottom_thickness = getattr(self, '_reference_bottom_thickness', 0.0)
@@ -3802,9 +3802,9 @@ class LaserGeometrySystem:
                 )
                 return
             
-            # Усредняем измерения датчика 1
-            avg_sensor1 = sum(self.calibrate_flange_sensor1_buffer) / len(self.calibrate_flange_sensor1_buffer)
-            print(f" [CMD=102] Среднее значение датчика 1: {avg_sensor1:.3f} мм (из {len(self.calibrate_flange_sensor1_buffer)} измерений)")
+            # Усеченное среднее в диапазоне [P5..P95]
+            _, avg_sensor1, _ = self.calculate_robust_stats(self.calibrate_flange_sensor1_buffer)
+            print(f" [CMD=102] Усеченное среднее (P5..P95) датчика 1: {avg_sensor1:.3f} мм (из {len(self.calibrate_flange_sensor1_buffer)} измерений)")
             
             # Читаем эталонный диаметр
             reference_diameter = self.read_reference_diameter()
@@ -3881,9 +3881,9 @@ class LaserGeometrySystem:
                 )
                 return
             
-            # Усредняем измерения датчика 3
-            avg_sensor3 = sum(self.calibrate_flange_diameter_sensor3_buffer) / len(self.calibrate_flange_diameter_sensor3_buffer)
-            print(f" [CMD=105] Среднее значение датчика 3: {avg_sensor3:.3f} мм (из {len(self.calibrate_flange_diameter_sensor3_buffer)} измерений)")
+            # Усеченное среднее в диапазоне [P5..P95]
+            _, avg_sensor3, _ = self.calculate_robust_stats(self.calibrate_flange_diameter_sensor3_buffer)
+            print(f" [CMD=105] Усеченное среднее (P5..P95) датчика 3: {avg_sensor3:.3f} мм (из {len(self.calibrate_flange_diameter_sensor3_buffer)} измерений)")
             
             # Читаем эталонный диаметр фланца
             reference_flange_diameter = self.read_reference_flange_diameter()
@@ -3955,7 +3955,7 @@ class LaserGeometrySystem:
                 )
                 return
 
-            avg_sensor3 = sum(self.calibrate_body_diameter_separate_sensor3_buffer) / len(self.calibrate_body_diameter_separate_sensor3_buffer)
+            _, avg_sensor3, _ = self.calculate_robust_stats(self.calibrate_body_diameter_separate_sensor3_buffer)
             reference_diameter = self.read_reference_body_diameter_separate()
             distance_sensor3_to_center = (reference_diameter / 2) + avg_sensor3
 
@@ -4014,7 +4014,7 @@ class LaserGeometrySystem:
                 )
                 return
 
-            avg_sensor3 = sum(self.calibrate_body2_diameter_sensor3_buffer) / len(self.calibrate_body2_diameter_sensor3_buffer)
+            _, avg_sensor3, _ = self.calculate_robust_stats(self.calibrate_body2_diameter_sensor3_buffer)
             reference_diameter = self.read_reference_body2_diameter()
             distance_sensor3_to_center = (reference_diameter / 2) + avg_sensor3
 
@@ -4141,9 +4141,9 @@ class LaserGeometrySystem:
             len(self.measurement_buffer['sensor3']) == 0):
             raise ValueError("Недостаточно данных для усреднения")
         
-        avg_sensor1 = sum(self.measurement_buffer['sensor1']) / len(self.measurement_buffer['sensor1'])
-        avg_sensor2 = sum(self.measurement_buffer['sensor2']) / len(self.measurement_buffer['sensor2'])
-        avg_sensor3 = sum(self.measurement_buffer['sensor3']) / len(self.measurement_buffer['sensor3'])
+        _, avg_sensor1, _ = self.calculate_robust_stats(self.measurement_buffer['sensor1'])
+        _, avg_sensor2, _ = self.calculate_robust_stats(self.measurement_buffer['sensor2'])
+        _, avg_sensor3, _ = self.calculate_robust_stats(self.measurement_buffer['sensor3'])
         
         return avg_sensor1, avg_sensor2, avg_sensor3
     
@@ -4258,7 +4258,7 @@ class LaserGeometrySystem:
         if len(self.measurement_buffer['sensor4']) == 0:
             raise ValueError("Недостаточно данных для усреднения датчика 4")
         
-        avg_sensor4 = sum(self.measurement_buffer['sensor4']) / len(self.measurement_buffer['sensor4'])
+        _, avg_sensor4, _ = self.calculate_robust_stats(self.measurement_buffer['sensor4'])
         return round(avg_sensor4, 3)
     
     def write_calibration_result_4_surface(self, distance: float):
@@ -4350,7 +4350,7 @@ class LaserGeometrySystem:
         if len(self.measurement_buffer['sensor1']) == 0:
             raise ValueError("Недостаточно данных для усреднения датчика 1")
         
-        avg_sensor1 = sum(self.measurement_buffer['sensor1']) / len(self.measurement_buffer['sensor1'])
+        _, avg_sensor1, _ = self.calculate_robust_stats(self.measurement_buffer['sensor1'])
         return round(avg_sensor1, 3)
     
     def write_calibration_result_1_center(self, distance: float):
@@ -4622,6 +4622,82 @@ class LaserGeometrySystem:
             extrapolated_buffer.append(extrapolated_value)
         
         return extrapolated_buffer
+
+    def _calculate_percentile(self, sorted_values: list, percentile: float) -> float:
+        """Линейная интерполяция процентиля для отсортированного списка."""
+        if not sorted_values:
+            raise ValueError("Пустой список для расчета процентиля")
+        if len(sorted_values) == 1:
+            return float(sorted_values[0])
+
+        bounded = max(0.0, min(100.0, percentile))
+        index = (len(sorted_values) - 1) * (bounded / 100.0)
+        lower_index = int(math.floor(index))
+        upper_index = int(math.ceil(index))
+
+        lower_value = float(sorted_values[lower_index])
+        upper_value = float(sorted_values[upper_index])
+        if lower_index == upper_index:
+            return lower_value
+
+        weight = index - lower_index
+        return lower_value + (upper_value - lower_value) * weight
+
+    def calculate_robust_stats(self, values: list, lower_percentile: float = 5.0, upper_percentile: float = 95.0) -> Tuple[float, float, float]:
+        """
+        Возвращает статистику в формате (max, avg, min) как:
+        max = P95, avg = усеченное среднее в диапазоне [P5..P95], min = P5.
+        """
+        valid_values = [
+            float(v) for v in values
+            if v is not None and not (math.isnan(v) or math.isinf(v))
+        ]
+        if not valid_values:
+            raise ValueError("Недостаточно данных для расчета робастной статистики")
+
+        sorted_values = sorted(valid_values)
+        p5 = self._calculate_percentile(sorted_values, lower_percentile)
+        p95 = self._calculate_percentile(sorted_values, upper_percentile)
+
+        trimmed_values = [v for v in valid_values if p5 <= v <= p95]
+        if not trimmed_values:
+            # Fallback по требованию: среднее экстраполированного буфера
+            trimmed_values = valid_values
+
+        trimmed_mean = sum(trimmed_values) / len(trimmed_values)
+        return p95, trimmed_mean, p5
+
+    def calculate_robust_stats_details(self, values: list, lower_percentile: float = 5.0, upper_percentile: float = 95.0) -> dict:
+        """
+        Расширенная статистика для отладки:
+        - p95 / p5
+        - trimmed_mean
+        - размер исходного и усеченного буфера
+        """
+        valid_values = [
+            float(v) for v in values
+            if v is not None and not (math.isnan(v) or math.isinf(v))
+        ]
+        if not valid_values:
+            raise ValueError("Недостаточно данных для расчета робастной статистики")
+
+        sorted_values = sorted(valid_values)
+        p5 = self._calculate_percentile(sorted_values, lower_percentile)
+        p95 = self._calculate_percentile(sorted_values, upper_percentile)
+        trimmed_values = [v for v in valid_values if p5 <= v <= p95]
+        if not trimmed_values:
+            trimmed_values = valid_values
+
+        trimmed_mean = sum(trimmed_values) / len(trimmed_values)
+        return {
+            "p95": p95,
+            "trimmed_mean": trimmed_mean,
+            "p5": p5,
+            "source_count": len(valid_values),
+            "trimmed_count": len(trimmed_values),
+            "raw_min": min(valid_values),
+            "raw_max": max(valid_values),
+        }
     
     def process_wall_measurement_results(self):
         """Обработка результатов измерения стенки при переходе 10→11"""
@@ -4640,10 +4716,9 @@ class LaserGeometrySystem:
             else:
                 extrapolated_buffer = self.wall_thickness_buffer
             
-            # Вычисляем статистику из экстраполированных значений
-            max_thickness = max(extrapolated_buffer)
-            min_thickness = min(extrapolated_buffer)
-            avg_thickness = sum(extrapolated_buffer) / len(extrapolated_buffer)
+            # Вычисляем статистику из экстраполированных значений:
+            # max=P95, avg=усеченное среднее [P5..P95], min=P5
+            max_thickness, avg_thickness, min_thickness = self.calculate_robust_stats(extrapolated_buffer)
             
             print(f" Результаты измерения верхней стенки:")
             print(f"   Измерений: {len(self.wall_thickness_buffer)}")
@@ -4692,9 +4767,7 @@ class LaserGeometrySystem:
             if len(self.sensor1_flange_measurements) > 0:
                 print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.sensor1_flange_measurements]}")
                 # Статистика по датчику 1
-                max_sensor1 = max(self.sensor1_flange_measurements)
-                min_sensor1 = min(self.sensor1_flange_measurements)
-                avg_sensor1 = sum(self.sensor1_flange_measurements) / len(self.sensor1_flange_measurements)
+                max_sensor1, avg_sensor1, min_sensor1 = self.calculate_robust_stats(self.sensor1_flange_measurements)
                 print(f"   СТАТИСТИКА: макс={max_sensor1:.3f}мм, сред={avg_sensor1:.3f}мм, мин={min_sensor1:.3f}мм")
             else:
                 print(f"   БУФЕР ПУСТ!")
@@ -4703,9 +4776,7 @@ class LaserGeometrySystem:
             if len(self.sensor3_measurements) > 0:
                 print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.sensor3_measurements]}")
                 # Статистика по датчику 3
-                max_sensor3 = max(self.sensor3_measurements)
-                min_sensor3 = min(self.sensor3_measurements)
-                avg_sensor3 = sum(self.sensor3_measurements) / len(self.sensor3_measurements)
+                max_sensor3, avg_sensor3, min_sensor3 = self.calculate_robust_stats(self.sensor3_measurements)
                 print(f"   СТАТИСТИКА: макс={max_sensor3:.3f}мм, сред={avg_sensor3:.3f}мм, мин={min_sensor3:.3f}мм")
             else:
                 print(f"   БУФЕР ПУСТ!")
@@ -4714,9 +4785,7 @@ class LaserGeometrySystem:
             if len(self.sensor4_measurements) > 0:
                 print(f"   ВСЕ значения: {[f'{x:.3f}' for x in self.sensor4_measurements]}")
                 # Статистика по датчику 4
-                max_sensor4 = max(self.sensor4_measurements)
-                min_sensor4 = min(self.sensor4_measurements)
-                avg_sensor4 = sum(self.sensor4_measurements) / len(self.sensor4_measurements)
+                max_sensor4, avg_sensor4, min_sensor4 = self.calculate_robust_stats(self.sensor4_measurements)
                 print(f"   СТАТИСТИКА: макс={max_sensor4:.3f}мм, сред={avg_sensor4:.3f}мм, мин={min_sensor4:.3f}мм")
             else:
                 print(f"   БУФЕР ПУСТ!")
@@ -4781,22 +4850,18 @@ class LaserGeometrySystem:
                     opposite_body_diameters.append(body_diameter)
                 
                 if len(opposite_body_diameters) > 0:
-                    max_body_diameter = max(opposite_body_diameters)
-                    min_body_diameter = min(opposite_body_diameters)
-                    avg_body_diameter = sum(opposite_body_diameters) / len(opposite_body_diameters)
+                    max_body_diameter, avg_body_diameter, min_body_diameter = self.calculate_robust_stats(opposite_body_diameters)
                     print(f" [DIAMETER] Вычислено {len(opposite_body_diameters)} диаметров корпуса из противоположных точек")
                 else:
                     # Fallback: если не удалось вычислить противоположные точки
                     print(" [WARNING] Не удалось вычислить диаметры корпуса из противоположных точек, используем старый метод")
-                    max_body_diameter = max(valid_body_radii) * 2 + body_diameter_offset
-                    min_body_diameter = min(valid_body_radii) * 2 + body_diameter_offset
-                    avg_body_diameter = (sum(valid_body_radii) / len(valid_body_radii)) * 2 + body_diameter_offset
+                    body_diameters = [(radius * 2 + body_diameter_offset) for radius in valid_body_radii]
+                    max_body_diameter, avg_body_diameter, min_body_diameter = self.calculate_robust_stats(body_diameters)
             else:
                 # Если измерений недостаточно для противоположных точек
                 print(" [WARNING] Недостаточно измерений для противоположных точек корпуса, используем старый метод")
-                max_body_diameter = max(valid_body_radii) * 2 + body_diameter_offset
-                min_body_diameter = min(valid_body_radii) * 2 + body_diameter_offset
-                avg_body_diameter = (sum(valid_body_radii) / len(valid_body_radii)) * 2 + body_diameter_offset
+                body_diameters = [(radius * 2 + body_diameter_offset) for radius in valid_body_radii]
+                max_body_diameter, avg_body_diameter, min_body_diameter = self.calculate_robust_stats(body_diameters)
             
             # Вычисляем статистику для диаметра фланца
             # Фильтруем некорректные значения (0, отрицательные, NaN, inf) перед вычислением статистики
@@ -4833,22 +4898,18 @@ class LaserGeometrySystem:
                     opposite_flange_diameters.append(flange_diameter)
                 
                 if len(opposite_flange_diameters) > 0:
-                    max_flange_diameter = max(opposite_flange_diameters)
-                    min_flange_diameter = min(opposite_flange_diameters)
-                    avg_flange_diameter = sum(opposite_flange_diameters) / len(opposite_flange_diameters)
+                    max_flange_diameter, avg_flange_diameter, min_flange_diameter = self.calculate_robust_stats(opposite_flange_diameters)
                     print(f" [DIAMETER] Вычислено {len(opposite_flange_diameters)} диаметров фланца из противоположных точек")
                 else:
                     # Fallback: если не удалось вычислить противоположные точки
                     print(" [WARNING] Не удалось вычислить диаметры фланца из противоположных точек, используем старый метод")
-                    max_flange_diameter = max(valid_flange_radii) * 2 + flange_diameter_offset
-                    min_flange_diameter = min(valid_flange_radii) * 2 + flange_diameter_offset
-                    avg_flange_diameter = (sum(valid_flange_radii) / len(valid_flange_radii)) * 2 + flange_diameter_offset
+                    flange_diameters = [(radius * 2 + flange_diameter_offset) for radius in valid_flange_radii]
+                    max_flange_diameter, avg_flange_diameter, min_flange_diameter = self.calculate_robust_stats(flange_diameters)
             else:
                 # Если измерений недостаточно для противоположных точек
                 print(" [WARNING] Недостаточно измерений для противоположных точек фланца, используем старый метод")
-                max_flange_diameter = max(valid_flange_radii) * 2 + flange_diameter_offset
-                min_flange_diameter = min(valid_flange_radii) * 2 + flange_diameter_offset
-                avg_flange_diameter = (sum(valid_flange_radii) / len(valid_flange_radii)) * 2 + flange_diameter_offset
+                flange_diameters = [(radius * 2 + flange_diameter_offset) for radius in valid_flange_radii]
+                max_flange_diameter, avg_flange_diameter, min_flange_diameter = self.calculate_robust_stats(flange_diameters)
             
             # Толщина фланца теперь передаётся с ПК, не рассчитывается здесь
             
@@ -4861,9 +4922,7 @@ class LaserGeometrySystem:
             else:
                 extrapolated_bottom_thickness = self.bottom_thickness_buffer
             
-            max_bottom_thickness = max(extrapolated_bottom_thickness)
-            min_bottom_thickness = min(extrapolated_bottom_thickness)
-            avg_bottom_thickness = sum(extrapolated_bottom_thickness) / len(extrapolated_bottom_thickness)
+            max_bottom_thickness, avg_bottom_thickness, min_bottom_thickness = self.calculate_robust_stats(extrapolated_bottom_thickness)
             
             print(f" Результаты измерения фланца:")
             print(f"   Измерений: {len(self.body_diameter_buffer)}")
@@ -4911,15 +4970,24 @@ class LaserGeometrySystem:
             print(f" Ошибка записи результатов измерения фланца: {e}")
 
     def calculate_diameter_stats_from_radii(self, radii_buffer: list, extrapolation_coeff: float, offset_coeff: float, label: str):
-        """Расчёт max/avg/min диаметра по буферу радиусов"""
+        """Расчёт max/avg/min диаметра по буферу радиусов (max=P95, avg=усеченное среднее, min=P5)"""
         valid_radii = [r for r in radii_buffer if r is not None and r > 0 and not (math.isnan(r) or math.isinf(r))]
         if len(valid_radii) == 0:
             print(f" ОШИБКА: Нет валидных значений радиуса ({label})!")
             return None
 
+        debug_body2 = (label == "корпус 2")
+        if debug_body2:
+            raw_avg = sum(valid_radii) / len(valid_radii)
+            print(f" [CMD=41][DEBUG] Радиусы до экстраполяции: N={len(valid_radii)}, min={min(valid_radii):.6f}, avg={raw_avg:.6f}, max={max(valid_radii):.6f}")
+            print(f" [CMD=41][DEBUG] Коэффициенты: extrapolation={extrapolation_coeff:.9f}, offset={offset_coeff:.9f}")
+
         if abs(extrapolation_coeff) > 0.0001:
             valid_radii = self.apply_extrapolation_to_buffer(valid_radii, extrapolation_coeff)
             print(f" [ЭКСТРАПОЛЯЦИЯ] {label}: применен коэффициент {extrapolation_coeff:.6f}")
+        if debug_body2:
+            ext_avg = sum(valid_radii) / len(valid_radii)
+            print(f" [CMD=41][DEBUG] Радиусы после экстраполяции: N={len(valid_radii)}, min={min(valid_radii):.6f}, avg={ext_avg:.6f}, max={max(valid_radii):.6f}")
 
         if len(valid_radii) >= 2:
             total_measurements = len(valid_radii)
@@ -4930,17 +4998,40 @@ class LaserGeometrySystem:
                 opposite_diameters.append(diameter_val)
 
             if len(opposite_diameters) > 0:
-                max_val = max(opposite_diameters)
-                min_val = min(opposite_diameters)
-                avg_val = sum(opposite_diameters) / len(opposite_diameters)
+                max_val, avg_val, min_val = self.calculate_robust_stats(opposite_diameters)
+                if debug_body2:
+                    details = self.calculate_robust_stats_details(opposite_diameters)
+                    print(
+                        f" [CMD=41][DEBUG] Диаметры из противоположных точек: N={details['source_count']}, "
+                        f"raw_min={details['raw_min']:.6f}, raw_max={details['raw_max']:.6f}"
+                    )
+                    print(
+                        f" [CMD=41][DEBUG] Робастная статистика: P95={details['p95']:.6f}, "
+                        f"TrimmedMean={details['trimmed_mean']:.6f}, P5={details['p5']:.6f}, "
+                        f"trimmed_N={details['trimmed_count']}/{details['source_count']}"
+                    )
             else:
-                max_val = max(valid_radii) * 2 + offset_coeff
-                min_val = min(valid_radii) * 2 + offset_coeff
-                avg_val = (sum(valid_radii) / len(valid_radii)) * 2 + offset_coeff
+                diameters = [(radius * 2 + offset_coeff) for radius in valid_radii]
+                max_val, avg_val, min_val = self.calculate_robust_stats(diameters)
+                if debug_body2:
+                    details = self.calculate_robust_stats_details(diameters)
+                    print(f" [CMD=41][DEBUG] Fallback по диаметрам (2*R+offset), N={details['source_count']}")
+                    print(
+                        f" [CMD=41][DEBUG] Робастная статистика: P95={details['p95']:.6f}, "
+                        f"TrimmedMean={details['trimmed_mean']:.6f}, P5={details['p5']:.6f}, "
+                        f"trimmed_N={details['trimmed_count']}/{details['source_count']}"
+                    )
         else:
-            max_val = max(valid_radii) * 2 + offset_coeff
-            min_val = min(valid_radii) * 2 + offset_coeff
-            avg_val = (sum(valid_radii) / len(valid_radii)) * 2 + offset_coeff
+            diameters = [(radius * 2 + offset_coeff) for radius in valid_radii]
+            max_val, avg_val, min_val = self.calculate_robust_stats(diameters)
+            if debug_body2:
+                details = self.calculate_robust_stats_details(diameters)
+                print(f" [CMD=41][DEBUG] Мало точек, fallback по диаметрам (2*R+offset), N={details['source_count']}")
+                print(
+                    f" [CMD=41][DEBUG] Робастная статистика: P95={details['p95']:.6f}, "
+                    f"TrimmedMean={details['trimmed_mean']:.6f}, P5={details['p5']:.6f}, "
+                    f"trimmed_N={details['trimmed_count']}/{details['source_count']}"
+                )
 
         return max_val, avg_val, min_val
 
@@ -4970,9 +5061,7 @@ class LaserGeometrySystem:
         else:
             extrapolated_bottom = self.bottom_thickness_buffer
 
-        max_bottom = max(extrapolated_bottom)
-        avg_bottom = sum(extrapolated_bottom) / len(extrapolated_bottom)
-        min_bottom = min(extrapolated_bottom)
+        max_bottom, avg_bottom, min_bottom = self.calculate_robust_stats(extrapolated_bottom)
 
         self.write_flange_only_measurement_results(
             max_flange, avg_flange, min_flange,
@@ -5061,10 +5150,9 @@ class LaserGeometrySystem:
             else:
                 extrapolated_buffer = self.bottom_wall_thickness_buffer
             
-            # Вычисляем статистику из экстраполированных значений
-            max_bottom_wall_thickness = max(extrapolated_buffer)
-            min_bottom_wall_thickness = min(extrapolated_buffer)
-            avg_bottom_wall_thickness = sum(extrapolated_buffer) / len(extrapolated_buffer)
+            # Вычисляем статистику из экстраполированных значений:
+            # max=P95, avg=усеченное среднее [P5..P95], min=P5
+            max_bottom_wall_thickness, avg_bottom_wall_thickness, min_bottom_wall_thickness = self.calculate_robust_stats(extrapolated_buffer)
             
             print(f" Результаты измерения нижней стенки:")
             print(f"   Измерений: {len(self.bottom_wall_thickness_buffer)}")
@@ -5467,10 +5555,9 @@ class LaserGeometrySystem:
                 print(" Ошибка: нет данных для расчета высоты")
                 return
             
-            # Вычисляем статистику
-            max_height = max(self.height_measurements)
-            min_height = min(self.height_measurements)
-            avg_height = sum(self.height_measurements) / len(self.height_measurements)
+            # Вычисляем статистику:
+            # max=P95, avg=усеченное среднее [P5..P95], min=P5
+            max_height, avg_height, min_height = self.calculate_robust_stats(self.height_measurements)
             
             # Записываем результаты в регистры
             self.write_height_measurement_results(max_height, avg_height, min_height)
@@ -6138,18 +6225,21 @@ def check_single_instance():
             found_processes = []
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 try:
-                    if proc.info['pid'] == current_pid:
+                    other_pid = proc.pid  # proc.pid надёжнее чем proc.info['pid']
+                    if other_pid == current_pid:
                         continue
                     
                     cmdline = proc.info.get('cmdline', [])
                     if cmdline and any(script_name in str(arg) for arg in cmdline):
                         # Найден другой процесс с тем же скриптом
-                        other_pid = proc.info['pid']
                         # Проверяем, что это действительно наш скрипт
                         if any('laser_geometry_system.py' in str(arg) for arg in cmdline):
                             found_processes.append(other_pid)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
+            
+            # Исключаем текущий процесс (на случай если psutil вернул его в списке)
+            found_processes = [p for p in found_processes if p != current_pid]
             
             # Если найдены другие процессы, ждем немного и проверяем снова
             # (возможно, это старые процессы, которые завершаются)
