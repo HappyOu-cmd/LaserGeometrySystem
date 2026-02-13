@@ -101,6 +101,7 @@ class ModbusDatabase:
                     height_avg REAL,
                     upper_wall_avg REAL,
                     body_diameter_avg REAL,
+                    body_diameter_2_avg REAL,
                     flange_diameter_avg REAL,
                     bottom_wall_avg REAL,
                     flange_thickness_avg REAL,
@@ -193,6 +194,14 @@ class ModbusDatabase:
             cursor.execute('ALTER TABLE measurement_history ADD COLUMN bottom_min REAL')
             cursor.execute('ALTER TABLE measurement_history ADD COLUMN bottom_status TEXT')
             print("Добавлены поля для дна в measurement_history")
+
+        # Проверяем, существуют ли новые поля в quality_measurements
+        cursor.execute("PRAGMA table_info(quality_measurements)")
+        quality_columns = [column[1] for column in cursor.fetchall()]
+
+        if 'body_diameter_2_avg' not in quality_columns:
+            cursor.execute('ALTER TABLE quality_measurements ADD COLUMN body_diameter_2_avg REAL')
+            print("Добавлено поле body_diameter_2_avg в quality_measurements")
     
     def save_register(self, address: int, register_type: str, value_high: int = 0, 
                      value_low: int = 0, float_value: float = 0.0, description: str = "",
@@ -737,16 +746,18 @@ class ModbusDatabase:
                     height_avg,
                     upper_wall_avg,
                     body_diameter_avg,
+                    body_diameter_2_avg,
                     flange_diameter_avg,
                     bottom_wall_avg,
                     flange_thickness_avg,
                     bottom_avg
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 shift_number,
                 measurement_data.get('height_avg'),
                 measurement_data.get('upper_wall_avg'),
                 measurement_data.get('body_diameter_avg'),
+                measurement_data.get('body_diameter_2_avg'),
                 measurement_data.get('flange_diameter_avg'),
                 measurement_data.get('bottom_wall_avg'),
                 measurement_data.get('flange_thickness_avg'),
@@ -772,6 +783,7 @@ class ModbusDatabase:
                     height_avg,
                     upper_wall_avg,
                     body_diameter_avg,
+                    body_diameter_2_avg,
                     flange_diameter_avg,
                     bottom_wall_avg,
                     flange_thickness_avg,
@@ -787,10 +799,11 @@ class ModbusDatabase:
                 'height_avg': row[1],
                 'upper_wall_avg': row[2],
                 'body_diameter_avg': row[3],
-                'flange_diameter_avg': row[4],
-                'bottom_wall_avg': row[5],
-                'flange_thickness_avg': row[6],
-                'bottom_avg': row[7]
+                'body_diameter_2_avg': row[4],
+                'flange_diameter_avg': row[5],
+                'bottom_wall_avg': row[6],
+                'flange_thickness_avg': row[7],
+                'bottom_avg': row[8]
             } for row in rows]
     
     def clear_shift_measurements(self, shift_number: int):

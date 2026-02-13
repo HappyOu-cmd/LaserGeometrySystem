@@ -289,8 +289,8 @@ class LaserGeometrySystem:
         self.height_calculated = False  # Флаг завершения расчета высоты
         
         # Временные буферы для усреднения (команда 10)
-        self.temp_sensor1_buffer = []  # Временный буфер для 10 измерений датчика 1
-        self.temp_sensor2_buffer = []  # Временный буфер для 10 измерений датчика 2
+        self.temp_sensor1_buffer = []  # Временный буфер сглаживания датчика 1
+        self.temp_sensor2_buffer = []  # Временный буфер сглаживания датчика 2
         
         # Буферы для команды 11 (измерение фланца)
         self.sensor1_flange_measurements = []  # Буфер усредненных измерений датчика 1 для команды 11
@@ -298,9 +298,9 @@ class LaserGeometrySystem:
         self.sensor4_measurements = []  # Буфер усредненных измерений датчика 4
         
         # Временные буферы для усреднения (команда 11)
-        self.temp_sensor1_flange_buffer = []  # Временный буфер для 10 измерений датчика 1 (команда 11)
-        self.temp_sensor3_buffer = []  # Временный буфер для 10 измерений датчика 3
-        self.temp_sensor4_buffer = []  # Временный буфер для 10 измерений датчика 4
+        self.temp_sensor1_flange_buffer = []  # Временный буфер сглаживания датчика 1 (команда 11)
+        self.temp_sensor3_buffer = []  # Временный буфер сглаживания датчика 3
+        self.temp_sensor4_buffer = []  # Временный буфер сглаживания датчика 4
         
         # Расчетные буферы для команды 11
         self.body_diameter_buffer = []    # Буфер диаметра корпуса (датчик 1)
@@ -312,8 +312,8 @@ class LaserGeometrySystem:
         self.sensor2_bottom_measurements = []  # Буфер усредненных измерений датчика 2 для команды 12
         
         # Временные буферы для усреднения (команда 12)
-        self.temp_sensor1_bottom_buffer = []  # Временный буфер для 10 измерений датчика 1 (команда 12)
-        self.temp_sensor2_bottom_buffer = []  # Временный буфер для 10 измерений датчика 2 (команда 12)
+        self.temp_sensor1_bottom_buffer = []  # Временный буфер сглаживания датчика 1 (команда 12)
+        self.temp_sensor2_bottom_buffer = []  # Временный буфер сглаживания датчика 2 (команда 12)
         
         # Расчетный буфер для команды 12
         self.bottom_wall_thickness_buffer = []  # Буфер толщины нижней стенки
@@ -800,6 +800,7 @@ class LaserGeometrySystem:
                 self.write_cycle_flag(10)
                 self.measurement_cycle_active = True
                 self.clear_measurement_buffers()
+                self.reset_measurement_result_registers()
                 # Сбрасываем флаги выполнения расчётов
                 self.wall_calculated = False
                 self.flange_calculated = False
@@ -1590,6 +1591,7 @@ class LaserGeometrySystem:
                         'height_avg': measurement_data.get('height_avg'),
                         'upper_wall_avg': measurement_data.get('upper_wall_avg'),
                         'body_diameter_avg': measurement_data.get('body_diameter_avg'),
+                        'body_diameter_2_avg': measurement_data.get('body_diameter_2_avg'),
                         'flange_diameter_avg': measurement_data.get('flange_diameter_avg'),
                         'bottom_wall_avg': measurement_data.get('bottom_wall_avg'),
                         'flange_thickness_avg': measurement_data.get('flange_thickness_avg'),
@@ -1800,6 +1802,13 @@ class LaserGeometrySystem:
                     'bad_less': 30217,
                     'bad_greater': 30222
                 },
+                {
+                    'label': 'Диаметр корпуса 2',
+                    'cond_less': 30224,
+                    'cond_greater': None,
+                    'bad_less': 30225,
+                    'bad_greater': 30226
+                },
             ]
             
             def get_reg_value(reg_number: Optional[int]) -> int:
@@ -1937,7 +1946,7 @@ class LaserGeometrySystem:
                 document.add_paragraph("")
                 
                 # Таблица измерений
-                measurements_table = document.add_table(rows=len(measurements) + 1, cols=8)
+                measurements_table = document.add_table(rows=len(measurements) + 1, cols=9)
                 measurements_table.style = 'Table Grid'
                 
                 # Заголовки столбцов
@@ -1950,6 +1959,7 @@ class LaserGeometrySystem:
                 header_row[5].text = "Толщина стенки внизу, мм среднее"
                 header_row[6].text = "Толщина фланца, мм"
                 header_row[7].text = "Толщина дна, мм среднее"
+                header_row[8].text = "Диаметр корпуса 2, мм среднее"
                 
                 # Выравнивание заголовков
                 for cell in header_row:
@@ -1969,10 +1979,11 @@ class LaserGeometrySystem:
                     row[5].text = f"{meas.get('bottom_wall_avg', 0):.3f}" if meas.get('bottom_wall_avg') is not None else "0.000"
                     row[6].text = f"{meas.get('flange_thickness_avg', 0):.3f}" if meas.get('flange_thickness_avg') is not None else "0.000"
                     row[7].text = f"{meas.get('bottom_avg', 0):.3f}" if meas.get('bottom_avg') is not None else "0.000"
+                    row[8].text = f"{meas.get('body_diameter_2_avg', 0):.3f}" if meas.get('body_diameter_2_avg') is not None else ""
                     
                     # Выравнивание: первый столбец по центру, остальные по центру
                     row[0].paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                    for i in range(1, 8):
+                    for i in range(1, 9):
                         row[i].paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
             
             document.save(filepath)
@@ -1984,6 +1995,51 @@ class LaserGeometrySystem:
         except Exception as e:
             print(f" [REPORT] Ошибка формирования отчёта: {e}")
     
+    def find_flash_drive_path(self, preferred_name: str = "ARS") -> Optional[str]:
+        """
+        Поиск точки монтирования флешки:
+        1) Сначала диск с именем preferred_name (например, ARS)
+        2) Иначе первая доступная для записи точка монтирования
+        """
+        candidate_roots = ["/media", "/run/media", "/mnt"]
+        preferred_name = preferred_name.upper()
+        preferred_candidates = []
+        fallback_candidates = []
+
+        def add_candidate(path: str):
+            if not os.path.isdir(path):
+                return
+            if not os.access(path, os.W_OK):
+                return
+            if os.path.basename(path).upper() == preferred_name:
+                preferred_candidates.append(path)
+            else:
+                fallback_candidates.append(path)
+
+        for root in candidate_roots:
+            if not os.path.isdir(root):
+                continue
+            try:
+                for level1 in os.listdir(root):
+                    path1 = os.path.join(root, level1)
+                    if not os.path.isdir(path1):
+                        continue
+                    add_candidate(path1)
+                    try:
+                        for level2 in os.listdir(path1):
+                            path2 = os.path.join(path1, level2)
+                            add_candidate(path2)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        if preferred_candidates:
+            return sorted(preferred_candidates)[0]
+        if fallback_candidates:
+            return sorted(fallback_candidates)[0]
+        return None
+
     def copy_report_to_flash(self, source_filepath: str, filename: str):
         """
         Копирует отчёт на флешку, если она доступна
@@ -1992,22 +2048,12 @@ class LaserGeometrySystem:
             source_filepath: Полный путь к исходному файлу отчёта
             filename: Имя файла отчёта
         """
-        # Путь к флешке
-        flash_drive_path = "/media/stend_1/ARS"
+        # Ищем флешку: сначала по имени ARS, иначе первую подключенную
+        flash_drive_path = self.find_flash_drive_path("ARS")
         
         try:
-            # Проверяем, существует ли флешка
-            if not os.path.exists(flash_drive_path):
-                print(f" [REPORT] Флешка не найдена: {flash_drive_path}")
-                return
-            
-            # Проверяем, что это директория и доступна для записи
-            if not os.path.isdir(flash_drive_path):
-                print(f" [REPORT] Путь не является директорией: {flash_drive_path}")
-                return
-            
-            if not os.access(flash_drive_path, os.W_OK):
-                print(f" [REPORT] Нет прав на запись в: {flash_drive_path}")
+            if not flash_drive_path:
+                print(" [REPORT] Флешка не найдена: нет доступных точек монтирования")
                 return
             
             # Создаём путь для сохранения на флешке
@@ -2022,6 +2068,37 @@ class LaserGeometrySystem:
             print(f" [REPORT] Ошибка доступа к флешке {flash_drive_path}: нет прав на запись")
         except Exception as e:
             print(f" [REPORT] Ошибка копирования отчёта на флешку: {e}")
+
+    def reset_measurement_result_registers(self):
+        """
+        Обнуление всех итоговых измерительных регистров (min/avg/max) перед новым циклом CMD=10.
+        """
+        if not self.modbus_server or not self.modbus_server.slave_context:
+            return
+
+        base_addresses = [
+            # Верхняя стенка
+            30016, 30018, 30020,
+            # Нижняя стенка
+            30022, 30024, 30026,
+            # Толщина дна
+            30028, 30030, 30032,
+            # Толщина фланца
+            30034, 30036, 30038,
+            # Высота
+            30040, 30042, 30044,
+            # Диаметр корпуса
+            30046, 30048, 30050,
+            # Диаметр фланца
+            30052, 30054, 30056,
+            # Диаметр корпуса 2
+            30059, 30061, 30063,
+        ]
+
+        for base_addr in base_addresses:
+            self.write_stream_result_to_input_registers(0.0, base_addr)
+
+        print(" [CMD=10] Обнулены все регистры итоговых измерений (min/avg/max)")
     
     def update_product_counters(self, result: str):
         """
@@ -2087,6 +2164,7 @@ class LaserGeometrySystem:
                 ('upper_wall', 'one_sided'): (201, 210, 219),  # 30202, 30211, 30220
                 ('flange_thickness', 'one_sided'): (202, 211, 220),  # 30203, 30212, 30221
                 ('body_diameter', 'one_sided'): (208, 217, 222),  # 30209, 30218, 30223
+                ('body_diameter_2', 'one_sided'): (223, 224, 225),  # 30224, 30225, 30226
                 ('flange_diameter', 'one_sided'): (207, 216, 221),  # 30208, 30217, 30222
                 ('bottom_wall', 'two_sided'): {
                     'cond_bad_greater': 203,  # 30204
@@ -2288,13 +2366,9 @@ class LaserGeometrySystem:
             self.modbus_server.slave_context.setValues(4, 102, [0])  # 30103 - условно-годных
             self.modbus_server.slave_context.setValues(4, 103, [0])  # 30104 - негодных
             
-            # Сбрасываем регистры статистики параметров 30201-30223
-            # Условно-негодные (30201-30209): индексы 200-208
-            for idx in range(200, 209):
-                self.modbus_server.slave_context.setValues(4, idx, [0])
-            
-            # Негодные (30210-30223): индексы 209-222
-            for idx in range(209, 223):
+            # Сбрасываем регистры статистики параметров 30201-30226
+            # Индексы 200-225 соответствуют 30201-30226
+            for idx in range(200, 226):
                 self.modbus_server.slave_context.setValues(4, idx, [0])
             
             print(" Счётчики изделий и статистика параметров сброшены для новой смены")
@@ -3259,6 +3333,101 @@ class LaserGeometrySystem:
     def read_body2_diameter_offset_coeff(self) -> float:
         """Коэффициент смещения диаметра корпуса 2 (40523-40524)"""
         return self._read_offset_coeff(522)
+
+    def _sanitize_percentile_bounds(self, lower: float, upper: float, param_name: str = "") -> Tuple[float, float]:
+        """
+        Нормализация процентилей из HMI.
+        Допустимый диапазон: 0..100, lower < upper.
+        При невалидных значениях используется fallback 0/100 (без процентильного отсечения).
+        """
+        fallback_lower = 0.0
+        fallback_upper = 100.0
+
+        try:
+            lower_val = float(lower)
+            upper_val = float(upper)
+        except Exception:
+            return fallback_lower, fallback_upper
+
+        if not (math.isfinite(lower_val) and math.isfinite(upper_val)):
+            return fallback_lower, fallback_upper
+
+        lower_val = max(0.0, min(100.0, lower_val))
+        upper_val = max(0.0, min(100.0, upper_val))
+
+        # Частый случай пустых регистров после старта
+        if abs(lower_val) < 1e-9 and abs(upper_val) < 1e-9:
+            return fallback_lower, fallback_upper
+
+        if lower_val >= upper_val:
+            print(f" [PERCENTILE] Некорректные границы для '{param_name}': Pmin={lower_val}, Pmax={upper_val}. Использую 0/100")
+            return fallback_lower, fallback_upper
+
+        return lower_val, upper_val
+
+    def read_percentile_bounds(self, param_key: str) -> Tuple[float, float]:
+        """
+        Чтение настраиваемых процентилей (Pmin, Pmax) из holding регистров.
+        Возвращает (lower, upper).
+        """
+        percentile_registers = {
+            'height': ((40530, 40531), (40532, 40533)),
+            'upper_wall': ((40534, 40535), (40536, 40537)),
+            'bottom_wall': ((40538, 40539), (40540, 40541)),
+            'bottom': ((40542, 40543), (40544, 40545)),
+            'body_diameter': ((40546, 40547), (40548, 40549)),
+            'flange_diameter': ((40550, 40551), (40552, 40553)),
+            'body_diameter_2': ((40554, 40555), (40556, 40557)),
+        }
+
+        if param_key not in percentile_registers:
+            return 0.0, 100.0
+
+        pmin_regs, pmax_regs = percentile_registers[param_key]
+        pmin = self.read_float_from_registers(pmin_regs, 'holding')
+        pmax = self.read_float_from_registers(pmax_regs, 'holding')
+        return self._sanitize_percentile_bounds(pmin, pmax, param_key)
+
+    def get_smoothing_window_size(self) -> int:
+        """
+        Единый размер окна сглаживания из регистра 40558-40559.
+        Правила:
+        - 0 или 1 -> 1 точка
+        - >1 -> округление до целого (2.45->2, 2.64->3, 4.01->4)
+        """
+        value = self.read_float_from_registers((40558, 40559), 'holding')
+        if not math.isfinite(value):
+            return 1
+        if value <= 1.0:
+            return 1
+        return max(1, int(math.floor(value + 0.5)))
+
+    @staticmethod
+    def _median_from_sorted(sorted_values: list) -> float:
+        count = len(sorted_values)
+        if count == 0:
+            return 0.0
+        mid = count // 2
+        if count % 2 == 0:
+            return (sorted_values[mid - 1] + sorted_values[mid]) / 2.0
+        return sorted_values[mid]
+
+    def _filtered_average_with_median(self, values: list, min_filtered_count: int) -> float:
+        """
+        Усреднение с медианным фильтром:
+        - медиана текущего окна
+        - отбрасываем точки, отклоняющиеся от медианы > 1.5 мм
+        - если отфильтрованных точек недостаточно, возвращаем медиану
+        """
+        if not values:
+            return 0.0
+
+        sorted_values = sorted(values)
+        median_value = self._median_from_sorted(sorted_values)
+        filtered_values = [v for v in values if abs(v - median_value) <= 1.5]
+        if len(filtered_values) >= max(1, min_filtered_count):
+            return sum(filtered_values) / len(filtered_values)
+        return median_value
 
     def _read_offset_coeff(self, base_index: int) -> float:
         """Общий метод чтения коэффициента смещения"""
@@ -4440,30 +4609,12 @@ class LaserGeometrySystem:
                 self.temp_sensor1_buffer.append(sensor1_mm)
                 self.temp_sensor2_buffer.append(sensor2_mm)
                 
-                # Когда накопилось 10 измерений - усредняем и записываем
-                if len(self.temp_sensor1_buffer) >= 10:
-                    # Фильтруем аномальные значения перед усреднением (используем медианный фильтр)
-                    sorted_sensor1 = sorted(self.temp_sensor1_buffer)
-                    sorted_sensor2 = sorted(self.temp_sensor2_buffer)
-                    
-                    # Вычисляем медиану
-                    median_sensor1 = (sorted_sensor1[4] + sorted_sensor1[5]) / 2.0
-                    median_sensor2 = (sorted_sensor2[4] + sorted_sensor2[5]) / 2.0
-                    
-                    # Фильтруем значения, которые отклоняются от медианы более чем на 1.5мм
-                    filtered_sensor1 = [v for v in self.temp_sensor1_buffer if abs(v - median_sensor1) <= 1.5]
-                    filtered_sensor2 = [v for v in self.temp_sensor2_buffer if abs(v - median_sensor2) <= 1.5]
-                    
-                    # Если после фильтрации осталось менее 5 значений - используем медиану
-                    if len(filtered_sensor1) >= 5:
-                        avg_sensor1 = sum(filtered_sensor1) / len(filtered_sensor1)
-                    else:
-                        avg_sensor1 = median_sensor1
-                    
-                    if len(filtered_sensor2) >= 5:
-                        avg_sensor2 = sum(filtered_sensor2) / len(filtered_sensor2)
-                    else:
-                        avg_sensor2 = median_sensor2
+                window_size = self.get_smoothing_window_size()
+                # Когда накопилось нужное количество измерений - усредняем и записываем
+                if len(self.temp_sensor1_buffer) >= window_size:
+                    min_filtered_count = max(1, window_size // 2)
+                    avg_sensor1 = self._filtered_average_with_median(self.temp_sensor1_buffer, min_filtered_count)
+                    avg_sensor2 = self._filtered_average_with_median(self.temp_sensor2_buffer, min_filtered_count)
                     
                     # Добавляем усредненные значения в основные буферы
                     self.sensor1_measurements.append(avg_sensor1)
@@ -4486,7 +4637,7 @@ class LaserGeometrySystem:
                     else:
                         print(" Ошибка: не удалось прочитать калиброванное расстояние 1,2")
                     
-                    # Очищаем временные буферы для следующих 10 измерений
+                    # Очищаем временные буферы для следующих измерений окна сглаживания
                     self.temp_sensor1_buffer = []
                     self.temp_sensor2_buffer = []
             else:
@@ -4643,7 +4794,7 @@ class LaserGeometrySystem:
         weight = index - lower_index
         return lower_value + (upper_value - lower_value) * weight
 
-    def calculate_robust_stats(self, values: list, lower_percentile: float = 5.0, upper_percentile: float = 95.0) -> Tuple[float, float, float]:
+    def calculate_robust_stats(self, values: list, lower_percentile: float = 0.0, upper_percentile: float = 100.0) -> Tuple[float, float, float]:
         """
         Возвращает статистику в формате (max, avg, min) как:
         max = P95, avg = усеченное среднее в диапазоне [P5..P95], min = P5.
@@ -4667,7 +4818,7 @@ class LaserGeometrySystem:
         trimmed_mean = sum(trimmed_values) / len(trimmed_values)
         return p95, trimmed_mean, p5
 
-    def calculate_robust_stats_details(self, values: list, lower_percentile: float = 5.0, upper_percentile: float = 95.0) -> dict:
+    def calculate_robust_stats_details(self, values: list, lower_percentile: float = 0.0, upper_percentile: float = 100.0) -> dict:
         """
         Расширенная статистика для отладки:
         - p95 / p5
@@ -4717,8 +4868,9 @@ class LaserGeometrySystem:
                 extrapolated_buffer = self.wall_thickness_buffer
             
             # Вычисляем статистику из экстраполированных значений:
-            # max=P95, avg=усеченное среднее [P5..P95], min=P5
-            max_thickness, avg_thickness, min_thickness = self.calculate_robust_stats(extrapolated_buffer)
+            # max=Pmax, avg=усеченное среднее [Pmin..Pmax], min=Pmin
+            pmin, pmax = self.read_percentile_bounds('upper_wall')
+            max_thickness, avg_thickness, min_thickness = self.calculate_robust_stats(extrapolated_buffer, pmin, pmax)
             
             print(f" Результаты измерения верхней стенки:")
             print(f"   Измерений: {len(self.wall_thickness_buffer)}")
@@ -4832,6 +4984,7 @@ class LaserGeometrySystem:
             # Вычисляем диаметры из противоположных точек (0° и 180°)
             # Формула: (distance_to_center - avg_sensor1_0deg) + (distance_to_center - avg_sensor1_180deg) + offset
             body_diameter_offset = self.read_body_diameter_offset_coeff()
+            body_pmin, body_pmax = self.read_percentile_bounds('body_diameter')
             opposite_body_diameters = []
             
             if len(valid_body_radii) >= 2:
@@ -4850,18 +5003,24 @@ class LaserGeometrySystem:
                     opposite_body_diameters.append(body_diameter)
                 
                 if len(opposite_body_diameters) > 0:
-                    max_body_diameter, avg_body_diameter, min_body_diameter = self.calculate_robust_stats(opposite_body_diameters)
+                    max_body_diameter, avg_body_diameter, min_body_diameter = self.calculate_robust_stats(
+                        opposite_body_diameters, body_pmin, body_pmax
+                    )
                     print(f" [DIAMETER] Вычислено {len(opposite_body_diameters)} диаметров корпуса из противоположных точек")
                 else:
                     # Fallback: если не удалось вычислить противоположные точки
                     print(" [WARNING] Не удалось вычислить диаметры корпуса из противоположных точек, используем старый метод")
                     body_diameters = [(radius * 2 + body_diameter_offset) for radius in valid_body_radii]
-                    max_body_diameter, avg_body_diameter, min_body_diameter = self.calculate_robust_stats(body_diameters)
+                    max_body_diameter, avg_body_diameter, min_body_diameter = self.calculate_robust_stats(
+                        body_diameters, body_pmin, body_pmax
+                    )
             else:
                 # Если измерений недостаточно для противоположных точек
                 print(" [WARNING] Недостаточно измерений для противоположных точек корпуса, используем старый метод")
                 body_diameters = [(radius * 2 + body_diameter_offset) for radius in valid_body_radii]
-                max_body_diameter, avg_body_diameter, min_body_diameter = self.calculate_robust_stats(body_diameters)
+                max_body_diameter, avg_body_diameter, min_body_diameter = self.calculate_robust_stats(
+                    body_diameters, body_pmin, body_pmax
+                )
             
             # Вычисляем статистику для диаметра фланца
             # Фильтруем некорректные значения (0, отрицательные, NaN, inf) перед вычислением статистики
@@ -4880,6 +5039,7 @@ class LaserGeometrySystem:
             # Вычисляем диаметры фланца из противоположных точек (0° и 180°)
             # Формула: (distance_to_center_flange - avg_sensor3_0deg) + (distance_to_center_flange - avg_sensor3_180deg) + offset
             flange_diameter_offset = self.read_flange_diameter_offset_coeff()
+            flange_pmin, flange_pmax = self.read_percentile_bounds('flange_diameter')
             opposite_flange_diameters = []
             
             if len(valid_flange_radii) >= 2:
@@ -4898,18 +5058,24 @@ class LaserGeometrySystem:
                     opposite_flange_diameters.append(flange_diameter)
                 
                 if len(opposite_flange_diameters) > 0:
-                    max_flange_diameter, avg_flange_diameter, min_flange_diameter = self.calculate_robust_stats(opposite_flange_diameters)
+                    max_flange_diameter, avg_flange_diameter, min_flange_diameter = self.calculate_robust_stats(
+                        opposite_flange_diameters, flange_pmin, flange_pmax
+                    )
                     print(f" [DIAMETER] Вычислено {len(opposite_flange_diameters)} диаметров фланца из противоположных точек")
                 else:
                     # Fallback: если не удалось вычислить противоположные точки
                     print(" [WARNING] Не удалось вычислить диаметры фланца из противоположных точек, используем старый метод")
                     flange_diameters = [(radius * 2 + flange_diameter_offset) for radius in valid_flange_radii]
-                    max_flange_diameter, avg_flange_diameter, min_flange_diameter = self.calculate_robust_stats(flange_diameters)
+                    max_flange_diameter, avg_flange_diameter, min_flange_diameter = self.calculate_robust_stats(
+                        flange_diameters, flange_pmin, flange_pmax
+                    )
             else:
                 # Если измерений недостаточно для противоположных точек
                 print(" [WARNING] Недостаточно измерений для противоположных точек фланца, используем старый метод")
                 flange_diameters = [(radius * 2 + flange_diameter_offset) for radius in valid_flange_radii]
-                max_flange_diameter, avg_flange_diameter, min_flange_diameter = self.calculate_robust_stats(flange_diameters)
+                max_flange_diameter, avg_flange_diameter, min_flange_diameter = self.calculate_robust_stats(
+                    flange_diameters, flange_pmin, flange_pmax
+                )
             
             # Толщина фланца теперь передаётся с ПК, не рассчитывается здесь
             
@@ -4922,7 +5088,10 @@ class LaserGeometrySystem:
             else:
                 extrapolated_bottom_thickness = self.bottom_thickness_buffer
             
-            max_bottom_thickness, avg_bottom_thickness, min_bottom_thickness = self.calculate_robust_stats(extrapolated_bottom_thickness)
+            bottom_pmin, bottom_pmax = self.read_percentile_bounds('bottom')
+            max_bottom_thickness, avg_bottom_thickness, min_bottom_thickness = self.calculate_robust_stats(
+                extrapolated_bottom_thickness, bottom_pmin, bottom_pmax
+            )
             
             print(f" Результаты измерения фланца:")
             print(f"   Измерений: {len(self.body_diameter_buffer)}")
@@ -4969,18 +5138,27 @@ class LaserGeometrySystem:
         except Exception as e:
             print(f" Ошибка записи результатов измерения фланца: {e}")
 
-    def calculate_diameter_stats_from_radii(self, radii_buffer: list, extrapolation_coeff: float, offset_coeff: float, label: str):
+    def calculate_diameter_stats_from_radii(
+        self,
+        radii_buffer: list,
+        extrapolation_coeff: float,
+        offset_coeff: float,
+        label: str,
+        percentile_param_key: str = 'body_diameter',
+    ):
         """Расчёт max/avg/min диаметра по буферу радиусов (max=P95, avg=усеченное среднее, min=P5)"""
         valid_radii = [r for r in radii_buffer if r is not None and r > 0 and not (math.isnan(r) or math.isinf(r))]
         if len(valid_radii) == 0:
             print(f" ОШИБКА: Нет валидных значений радиуса ({label})!")
             return None
 
+        pmin, pmax = self.read_percentile_bounds(percentile_param_key)
         debug_body2 = (label == "корпус 2")
         if debug_body2:
             raw_avg = sum(valid_radii) / len(valid_radii)
             print(f" [CMD=41][DEBUG] Радиусы до экстраполяции: N={len(valid_radii)}, min={min(valid_radii):.6f}, avg={raw_avg:.6f}, max={max(valid_radii):.6f}")
             print(f" [CMD=41][DEBUG] Коэффициенты: extrapolation={extrapolation_coeff:.9f}, offset={offset_coeff:.9f}")
+            print(f" [CMD=41][DEBUG] Процентили: Pmin={pmin:.3f}, Pmax={pmax:.3f}")
 
         if abs(extrapolation_coeff) > 0.0001:
             valid_radii = self.apply_extrapolation_to_buffer(valid_radii, extrapolation_coeff)
@@ -4998,9 +5176,9 @@ class LaserGeometrySystem:
                 opposite_diameters.append(diameter_val)
 
             if len(opposite_diameters) > 0:
-                max_val, avg_val, min_val = self.calculate_robust_stats(opposite_diameters)
+                max_val, avg_val, min_val = self.calculate_robust_stats(opposite_diameters, pmin, pmax)
                 if debug_body2:
-                    details = self.calculate_robust_stats_details(opposite_diameters)
+                    details = self.calculate_robust_stats_details(opposite_diameters, pmin, pmax)
                     print(
                         f" [CMD=41][DEBUG] Диаметры из противоположных точек: N={details['source_count']}, "
                         f"raw_min={details['raw_min']:.6f}, raw_max={details['raw_max']:.6f}"
@@ -5012,9 +5190,9 @@ class LaserGeometrySystem:
                     )
             else:
                 diameters = [(radius * 2 + offset_coeff) for radius in valid_radii]
-                max_val, avg_val, min_val = self.calculate_robust_stats(diameters)
+                max_val, avg_val, min_val = self.calculate_robust_stats(diameters, pmin, pmax)
                 if debug_body2:
-                    details = self.calculate_robust_stats_details(diameters)
+                    details = self.calculate_robust_stats_details(diameters, pmin, pmax)
                     print(f" [CMD=41][DEBUG] Fallback по диаметрам (2*R+offset), N={details['source_count']}")
                     print(
                         f" [CMD=41][DEBUG] Робастная статистика: P95={details['p95']:.6f}, "
@@ -5023,9 +5201,9 @@ class LaserGeometrySystem:
                     )
         else:
             diameters = [(radius * 2 + offset_coeff) for radius in valid_radii]
-            max_val, avg_val, min_val = self.calculate_robust_stats(diameters)
+            max_val, avg_val, min_val = self.calculate_robust_stats(diameters, pmin, pmax)
             if debug_body2:
-                details = self.calculate_robust_stats_details(diameters)
+                details = self.calculate_robust_stats_details(diameters, pmin, pmax)
                 print(f" [CMD=41][DEBUG] Мало точек, fallback по диаметрам (2*R+offset), N={details['source_count']}")
                 print(
                     f" [CMD=41][DEBUG] Робастная статистика: P95={details['p95']:.6f}, "
@@ -5048,7 +5226,8 @@ class LaserGeometrySystem:
             self.flange_diameter_buffer,
             self.read_flange_diameter_extrapolation_coeff(),
             self.read_flange_diameter_offset_coeff(),
-            "фланец (раздельно)"
+            "фланец (раздельно)",
+            percentile_param_key='flange_diameter',
         )
         if not flange_stats:
             return
@@ -5061,7 +5240,8 @@ class LaserGeometrySystem:
         else:
             extrapolated_bottom = self.bottom_thickness_buffer
 
-        max_bottom, avg_bottom, min_bottom = self.calculate_robust_stats(extrapolated_bottom)
+        bottom_pmin, bottom_pmax = self.read_percentile_bounds('bottom')
+        max_bottom, avg_bottom, min_bottom = self.calculate_robust_stats(extrapolated_bottom, bottom_pmin, bottom_pmax)
 
         self.write_flange_only_measurement_results(
             max_flange, avg_flange, min_flange,
@@ -5080,7 +5260,8 @@ class LaserGeometrySystem:
             self.body_only_diameter_buffer,
             self.read_body_diameter_extrapolation_coeff(),
             self.read_body_diameter_offset_coeff(),
-            "корпус (раздельно)"
+            "корпус (раздельно)",
+            percentile_param_key='body_diameter',
         )
         if not stats:
             return
@@ -5098,7 +5279,8 @@ class LaserGeometrySystem:
             self.body2_diameter_buffer,
             self.read_body2_diameter_extrapolation_coeff(),
             self.read_body2_diameter_offset_coeff(),
-            "корпус 2"
+            "корпус 2",
+            percentile_param_key='body_diameter_2',
         )
         if not stats:
             return
@@ -5151,8 +5333,11 @@ class LaserGeometrySystem:
                 extrapolated_buffer = self.bottom_wall_thickness_buffer
             
             # Вычисляем статистику из экстраполированных значений:
-            # max=P95, avg=усеченное среднее [P5..P95], min=P5
-            max_bottom_wall_thickness, avg_bottom_wall_thickness, min_bottom_wall_thickness = self.calculate_robust_stats(extrapolated_buffer)
+            # max=Pmax, avg=усеченное среднее [Pmin..Pmax], min=Pmin
+            pmin, pmax = self.read_percentile_bounds('bottom_wall')
+            max_bottom_wall_thickness, avg_bottom_wall_thickness, min_bottom_wall_thickness = self.calculate_robust_stats(
+                extrapolated_buffer, pmin, pmax
+            )
             
             print(f" Результаты измерения нижней стенки:")
             print(f"   Измерений: {len(self.bottom_wall_thickness_buffer)}")
@@ -5252,41 +5437,13 @@ class LaserGeometrySystem:
                 self.temp_sensor3_buffer.append(sensor3_mm)
                 self.temp_sensor4_buffer.append(sensor4_mm)
                 
-                # Когда накопилось 10 измерений - усредняем и записываем
-                if len(self.temp_sensor1_flange_buffer) >= 10:
-                    # Фильтруем аномальные значения перед усреднением (используем медианный фильтр)
-                    # Сортируем значения и берем медиану для каждого датчика
-                    sorted_sensor1 = sorted(self.temp_sensor1_flange_buffer)
-                    sorted_sensor3 = sorted(self.temp_sensor3_buffer)
-                    sorted_sensor4 = sorted(self.temp_sensor4_buffer)
-                    
-                    # Вычисляем медиану (среднее из двух центральных значений для четного количества)
-                    median_sensor1 = (sorted_sensor1[4] + sorted_sensor1[5]) / 2.0
-                    median_sensor3 = (sorted_sensor3[4] + sorted_sensor3[5]) / 2.0
-                    median_sensor4 = (sorted_sensor4[4] + sorted_sensor4[5]) / 2.0
-                    
-                    # Фильтруем значения, которые отклоняются от медианы более чем на 1.5мм
-                    # Это поможет отбросить аномальные значения
-                    filtered_sensor1 = [v for v in self.temp_sensor1_flange_buffer if abs(v - median_sensor1) <= 1.5]
-                    filtered_sensor3 = [v for v in self.temp_sensor3_buffer if abs(v - median_sensor3) <= 1.5]
-                    filtered_sensor4 = [v for v in self.temp_sensor4_buffer if abs(v - median_sensor4) <= 1.5]
-                    
-                    # Если после фильтрации осталось менее 5 значений - используем медиану
-                    # Иначе используем среднее отфильтрованных значений
-                    if len(filtered_sensor1) >= 5:
-                        avg_sensor1 = sum(filtered_sensor1) / len(filtered_sensor1)
-                    else:
-                        avg_sensor1 = median_sensor1
-                    
-                    if len(filtered_sensor3) >= 5:
-                        avg_sensor3 = sum(filtered_sensor3) / len(filtered_sensor3)
-                    else:
-                        avg_sensor3 = median_sensor3
-                    
-                    if len(filtered_sensor4) >= 5:
-                        avg_sensor4 = sum(filtered_sensor4) / len(filtered_sensor4)
-                    else:
-                        avg_sensor4 = median_sensor4
+                window_size = self.get_smoothing_window_size()
+                # Когда накопилось нужное количество измерений - усредняем и записываем
+                if len(self.temp_sensor1_flange_buffer) >= window_size:
+                    min_filtered_count = max(1, window_size // 2)
+                    avg_sensor1 = self._filtered_average_with_median(self.temp_sensor1_flange_buffer, min_filtered_count)
+                    avg_sensor3 = self._filtered_average_with_median(self.temp_sensor3_buffer, min_filtered_count)
+                    avg_sensor4 = self._filtered_average_with_median(self.temp_sensor4_buffer, min_filtered_count)
                     
                     # Добавляем усредненные значения в основные буферы
                     self.sensor1_flange_measurements.append(avg_sensor1)
@@ -5331,7 +5488,7 @@ class LaserGeometrySystem:
                     else:
                         print(" Ошибка: не удалось прочитать калиброванные значения")
                     
-                    # Очищаем временные буферы для следующих 10 измерений
+                    # Очищаем временные буферы для следующих измерений окна сглаживания
                     self.temp_sensor1_flange_buffer = []
                     self.temp_sensor3_buffer = []
                     self.temp_sensor4_buffer = []
@@ -5390,30 +5547,12 @@ class LaserGeometrySystem:
                 self.temp_sensor1_bottom_buffer.append(sensor1_mm)
                 self.temp_sensor2_bottom_buffer.append(sensor2_mm)
                 
-                # Когда накопилось 10 измерений - усредняем и записываем
-                if len(self.temp_sensor1_bottom_buffer) >= 10:
-                    # Фильтруем аномальные значения перед усреднением (используем медианный фильтр)
-                    sorted_sensor1 = sorted(self.temp_sensor1_bottom_buffer)
-                    sorted_sensor2 = sorted(self.temp_sensor2_bottom_buffer)
-                    
-                    # Вычисляем медиану
-                    median_sensor1 = (sorted_sensor1[4] + sorted_sensor1[5]) / 2.0
-                    median_sensor2 = (sorted_sensor2[4] + sorted_sensor2[5]) / 2.0
-                    
-                    # Фильтруем значения, которые отклоняются от медианы более чем на 1.5мм
-                    filtered_sensor1 = [v for v in self.temp_sensor1_bottom_buffer if abs(v - median_sensor1) <= 1.5]
-                    filtered_sensor2 = [v for v in self.temp_sensor2_bottom_buffer if abs(v - median_sensor2) <= 1.5]
-                    
-                    # Если после фильтрации осталось менее 5 значений - используем медиану
-                    if len(filtered_sensor1) >= 5:
-                        avg_sensor1 = sum(filtered_sensor1) / len(filtered_sensor1)
-                    else:
-                        avg_sensor1 = median_sensor1
-                    
-                    if len(filtered_sensor2) >= 5:
-                        avg_sensor2 = sum(filtered_sensor2) / len(filtered_sensor2)
-                    else:
-                        avg_sensor2 = median_sensor2
+                window_size = self.get_smoothing_window_size()
+                # Когда накопилось нужное количество измерений - усредняем и записываем
+                if len(self.temp_sensor1_bottom_buffer) >= window_size:
+                    min_filtered_count = max(1, window_size // 2)
+                    avg_sensor1 = self._filtered_average_with_median(self.temp_sensor1_bottom_buffer, min_filtered_count)
+                    avg_sensor2 = self._filtered_average_with_median(self.temp_sensor2_bottom_buffer, min_filtered_count)
                     
                     # Добавляем усредненные значения в основные буферы
                     self.sensor1_bottom_measurements.append(avg_sensor1)
@@ -5436,7 +5575,7 @@ class LaserGeometrySystem:
                     else:
                         print(" Ошибка: не удалось прочитать калиброванное расстояние 1,2")
                     
-                    # Очищаем временные буферы для следующих 10 измерений
+                    # Очищаем временные буферы для следующих измерений окна сглаживания
                     self.temp_sensor1_bottom_buffer = []
                     self.temp_sensor2_bottom_buffer = []
             else:
@@ -5556,8 +5695,9 @@ class LaserGeometrySystem:
                 return
             
             # Вычисляем статистику:
-            # max=P95, avg=усеченное среднее [P5..P95], min=P5
-            max_height, avg_height, min_height = self.calculate_robust_stats(self.height_measurements)
+            # max=Pmax, avg=усеченное среднее [Pmin..Pmax], min=Pmin
+            pmin, pmax = self.read_percentile_bounds('height')
+            max_height, avg_height, min_height = self.calculate_robust_stats(self.height_measurements, pmin, pmax)
             
             # Записываем результаты в регистры
             self.write_height_measurement_results(max_height, avg_height, min_height)
@@ -5772,16 +5912,12 @@ class LaserGeometrySystem:
             return
 
         temp_buffer.append(sensor3_mm)
-        if len(temp_buffer) < 10:
+        window_size = self.get_smoothing_window_size()
+        if len(temp_buffer) < window_size:
             return
 
-        sorted_sensor3 = sorted(temp_buffer)
-        median_sensor3 = (sorted_sensor3[4] + sorted_sensor3[5]) / 2.0
-        filtered_sensor3 = [v for v in temp_buffer if abs(v - median_sensor3) <= 1.5]
-        if len(filtered_sensor3) >= 5:
-            avg_sensor3 = sum(filtered_sensor3) / len(filtered_sensor3)
-        else:
-            avg_sensor3 = median_sensor3
+        min_filtered_count = max(1, window_size // 2)
+        avg_sensor3 = self._filtered_average_with_median(temp_buffer, min_filtered_count)
 
         radius = distance_to_center - avg_sensor3
         radii_buffer.append(radius)
@@ -5808,26 +5944,13 @@ class LaserGeometrySystem:
 
         self.temp_sensor3_flange_only_buffer.append(sensor3_mm)
         self.temp_sensor4_buffer.append(sensor4_mm)
-        if len(self.temp_sensor3_flange_only_buffer) < 10:
+        window_size = self.get_smoothing_window_size()
+        if len(self.temp_sensor3_flange_only_buffer) < window_size:
             return
 
-        sorted_sensor3 = sorted(self.temp_sensor3_flange_only_buffer)
-        sorted_sensor4 = sorted(self.temp_sensor4_buffer)
-        median_sensor3 = (sorted_sensor3[4] + sorted_sensor3[5]) / 2.0
-        median_sensor4 = (sorted_sensor4[4] + sorted_sensor4[5]) / 2.0
-
-        filtered_sensor3 = [v for v in self.temp_sensor3_flange_only_buffer if abs(v - median_sensor3) <= 1.5]
-        filtered_sensor4 = [v for v in self.temp_sensor4_buffer if abs(v - median_sensor4) <= 1.5]
-
-        if len(filtered_sensor3) >= 5:
-            avg_sensor3 = sum(filtered_sensor3) / len(filtered_sensor3)
-        else:
-            avg_sensor3 = median_sensor3
-
-        if len(filtered_sensor4) >= 5:
-            avg_sensor4 = sum(filtered_sensor4) / len(filtered_sensor4)
-        else:
-            avg_sensor4 = median_sensor4
+        min_filtered_count = max(1, window_size // 2)
+        avg_sensor3 = self._filtered_average_with_median(self.temp_sensor3_flange_only_buffer, min_filtered_count)
+        avg_sensor4 = self._filtered_average_with_median(self.temp_sensor4_buffer, min_filtered_count)
 
         flange_radius = self.cached_distance_sensor3_to_center - avg_sensor3
         bottom_thickness = self.cached_distance_sensor4 - avg_sensor4 + self.read_bottom_thickness_offset_coeff()
@@ -6131,7 +6254,8 @@ class LaserGeometrySystem:
                 self.stream_temp_sensor4_buffer.append(sensor4_mm)
                 
                 # Когда накопилось 10 измерений - усредняем и записываем в регистры
-                if len(self.stream_temp_sensor1_buffer) >= 10:
+                window_size = self.get_smoothing_window_size()
+                if len(self.stream_temp_sensor1_buffer) >= window_size:
                     # Вычисляем средние значения для каждого датчика
                     avg_sensor1 = sum(self.stream_temp_sensor1_buffer) / len(self.stream_temp_sensor1_buffer)
                     avg_sensor2 = sum(self.stream_temp_sensor2_buffer) / len(self.stream_temp_sensor2_buffer)
@@ -6166,7 +6290,7 @@ class LaserGeometrySystem:
                         
                         self._last_stream_quad_print = current_time
                     
-                    # Очищаем временные буферы для следующих 10 измерений
+                    # Очищаем временные буферы для следующих измерений окна сглаживания
                     self.stream_temp_sensor1_buffer = []
                     self.stream_temp_sensor2_buffer = []
                     self.stream_temp_sensor3_buffer = []
