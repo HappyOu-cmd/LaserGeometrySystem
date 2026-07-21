@@ -3334,6 +3334,33 @@ class LaserGeometrySystem:
         """Коэффициент смещения диаметра корпуса 2 (40523-40524)"""
         return self._read_offset_coeff(522)
 
+    EXTREMA_OFFSET_REGISTERS = {
+        'upper_wall': (560, 562),
+        'lower_wall': (564, 566),
+        'body_diameter': (568, 570),
+        'flange_diameter': (572, 574),
+        'bottom_thickness': (576, 578),
+        'body_diameter_2': (580, 582),
+    }
+
+    def apply_extrema_offsets(self, parameter: str, max_value: float, min_value: float) -> Tuple[float, float]:
+        """Прибавляет отдельные смещения к окончательным max/min; среднее не изменяется."""
+        registers = self.EXTREMA_OFFSET_REGISTERS.get(parameter)
+        if registers is None:
+            raise ValueError(f"Неизвестный параметр коэффициентов min/max: {parameter}")
+
+        min_offset = self._read_offset_coeff(registers[0])
+        max_offset = self._read_offset_coeff(registers[1])
+        adjusted_max = max_value + max_offset
+        adjusted_min = min_value + min_offset
+
+        print(
+            f" [СМЕЩЕНИЕ MIN/MAX] {parameter}: "
+            f"max {max_value:.6f} + {max_offset:.6f} = {adjusted_max:.6f}; "
+            f"min {min_value:.6f} + {min_offset:.6f} = {adjusted_min:.6f}"
+        )
+        return adjusted_max, adjusted_min
+
     def _sanitize_percentile_bounds(self, lower: float, upper: float, param_name: str = "") -> Tuple[float, float]:
         """
         Нормализация процентилей из HMI.
@@ -4888,6 +4915,7 @@ class LaserGeometrySystem:
         """Запись результатов измерения стенки в регистры"""
         try:
             if self.modbus_server and self.modbus_server.slave_context:
+                max_val, min_val = self.apply_extrema_offsets('upper_wall', max_val, min_val)
                 # Максимальная толщина → 30016-30017
                 self.write_stream_result_to_input_registers(max_val, 30016)
                 
@@ -5116,6 +5144,15 @@ class LaserGeometrySystem:
         """Запись результатов измерения фланца в регистры"""
         try:
             if self.modbus_server and self.modbus_server.slave_context:
+                max_body_diameter, min_body_diameter = self.apply_extrema_offsets(
+                    'body_diameter', max_body_diameter, min_body_diameter
+                )
+                max_flange_diameter, min_flange_diameter = self.apply_extrema_offsets(
+                    'flange_diameter', max_flange_diameter, min_flange_diameter
+                )
+                max_bottom_thickness, min_bottom_thickness = self.apply_extrema_offsets(
+                    'bottom_thickness', max_bottom_thickness, min_bottom_thickness
+                )
                 # Диаметр корпуса → 30046-30051
                 self.write_stream_result_to_input_registers(max_body_diameter, 30046)   # Максимальное
                 self.write_stream_result_to_input_registers(avg_body_diameter, 30048)   # Среднее
@@ -5294,6 +5331,8 @@ class LaserGeometrySystem:
         max_bottom: float, avg_bottom: float, min_bottom: float
     ):
         """Запись результатов раздельного измерения фланца и толщины дна"""
+        max_flange, min_flange = self.apply_extrema_offsets('flange_diameter', max_flange, min_flange)
+        max_bottom, min_bottom = self.apply_extrema_offsets('bottom_thickness', max_bottom, min_bottom)
         # Диаметр фланца → 30052-30057
         self.write_stream_result_to_input_registers(max_flange, 30054)
         self.write_stream_result_to_input_registers(avg_flange, 30052)
@@ -5305,12 +5344,14 @@ class LaserGeometrySystem:
 
     def write_body_only_measurement_results(self, max_val: float, avg_val: float, min_val: float):
         """Запись результатов раздельного измерения диаметра корпуса в 30046-30051"""
+        max_val, min_val = self.apply_extrema_offsets('body_diameter', max_val, min_val)
         self.write_stream_result_to_input_registers(max_val, 30046)
         self.write_stream_result_to_input_registers(avg_val, 30048)
         self.write_stream_result_to_input_registers(min_val, 30050)
 
     def write_body2_measurement_results(self, max_val: float, avg_val: float, min_val: float):
         """Запись результатов диаметра корпуса 2 в 30059-30064"""
+        max_val, min_val = self.apply_extrema_offsets('body_diameter_2', max_val, min_val)
         self.write_stream_result_to_input_registers(max_val, 30059)
         self.write_stream_result_to_input_registers(avg_val, 30061)
         self.write_stream_result_to_input_registers(min_val, 30063)
@@ -5355,6 +5396,7 @@ class LaserGeometrySystem:
         """Запись результатов измерения нижней стенки в регистры"""
         try:
             if self.modbus_server and self.modbus_server.slave_context:
+                max_val, min_val = self.apply_extrema_offsets('lower_wall', max_val, min_val)
                 # Максимальная толщина нижней стенки → 30022-30023
                 self.write_stream_result_to_input_registers(max_val, 30022)
                 

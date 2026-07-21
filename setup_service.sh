@@ -1,111 +1,94 @@
-#!/bin/bash
-# Скрипт для настройки автозапуска Laser Geometry System через systemd
+#!/usr/bin/env bash
+# Установка Laser Geometry System как системного сервиса systemd.
+# Сервис работает от обычного пользователя, а право на порт 502 получает от systemd.
 
-# Определяем путь к проекту (текущая директория)
+set -euo pipefail
+
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-USER_NAME=$(whoami)
 SERVICE_NAME="laser_geometry.service"
-SERVICE_DIR="$HOME/.config/systemd/user"
+SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"
+
+# Скрипт можно запускать как обычным пользователем, так и через sudo.
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    TARGET_USER="$SUDO_USER"
+else
+    TARGET_USER="$(id -un)"
+fi
+TARGET_GROUP="$(id -gn "$TARGET_USER")"
+
+PYTHON_BIN="$PROJECT_DIR/.venv/bin/python3"
+MAIN_SCRIPT="$PROJECT_DIR/laser_geometry_system.py"
 
 echo "=========================================="
-echo "Настройка автозапуска Laser Geometry System"
+echo "Установка Laser Geometry System"
 echo "=========================================="
 echo "Путь к проекту: $PROJECT_DIR"
-echo "Пользователь: $USER_NAME"
-echo ""
+echo "Пользователь:   $TARGET_USER"
+echo "Группа:         $TARGET_GROUP"
+echo "Сервис:         $SERVICE_FILE"
+echo
 
-# Проверяем наличие виртуального окружения
-if [ ! -d "$PROJECT_DIR/.venv" ]; then
-    echo "ОШИБКА: Виртуальное окружение не найдено!"
-    echo "Создайте виртуальное окружение:"
-    echo "  cd $PROJECT_DIR"
-    echo "  python3 -m venv .venv"
-    echo "  source .venv/bin/activate"
-    echo "  pip install -r requirements.txt"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "ОШИБКА: Python виртуального окружения не найден: $PYTHON_BIN" >&2
+    echo "Сначала создайте .venv и установите зависимости." >&2
     exit 1
 fi
 
-# Проверяем наличие основного скрипта
-if [ ! -f "$PROJECT_DIR/laser_geometry_system.py" ]; then
-    echo "ОШИБКА: Файл laser_geometry_system.py не найден!"
+if [[ ! -f "$MAIN_SCRIPT" ]]; then
+    echo "ОШИБКА: Основной файл не найден: $MAIN_SCRIPT" >&2
     exit 1
 fi
 
-# Создаем директорию для сервисов пользователя, если её нет
-mkdir -p "$SERVICE_DIR"
+# Не допускаем одновременный запуск старого user-unit и нового system-unit.
+if [[ "$TARGET_USER" == "$(id -un)" ]]; then
+    systemctl --user disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+fi
 
-# Создаем файл сервиса
-SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME"
-cat > "$SERVICE_FILE" << EOF
+UNIT_TMP="$(mktemp)"
+trap 'rm -f "$UNIT_TMP"' EXIT
+
+cat > "$UNIT_TMP" <<EOF
 [Unit]
 Description=Laser Geometry System
 After=network-online.target
 Wants=network-online.target
-# Дополнительная задержка для готовности IP адреса
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+User=$TARGET_USER
+Group=$TARGET_GROUP
 WorkingDirectory=$PROJECT_DIR
-ExecStart=$PROJECT_DIR/.venv/bin/python3 $PROJECT_DIR/laser_geometry_system.py
+ExecStart=$PYTHON_BIN -u $MAIN_SCRIPT
+
+# Разрешает непривилегированному Python слушать стандартный Modbus TCP порт 502.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
 Restart=always
-RestartSec=10
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
-# Предотвращаем запуск нескольких экземпляров через systemd
-ExecStartPre=/bin/sleep 2
-
-# Переменные окружения
-Environment="PATH=$PROJECT_DIR/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-
-# Убираем проверку групп, которая может вызывать ошибки
-SupplementaryGroups=
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 
-echo "✓ Файл сервиса создан: $SERVICE_FILE"
-echo ""
+echo "Установка systemd unit (sudo потребуется только при развёртывании)..."
+sudo install -o root -g root -m 0644 "$UNIT_TMP" "$SERVICE_FILE"
+sudo systemctl daemon-reload
+sudo systemctl enable --now "$SERVICE_NAME"
 
-# Перезагружаем конфигурацию systemd
-echo "Перезагрузка конфигурации systemd..."
-systemctl --user daemon-reload
-
-if [ $? -eq 0 ]; then
-    echo "✓ Конфигурация systemd перезагружена"
-else
-    echo "✗ Ошибка перезагрузки конфигурации systemd"
-    exit 1
-fi
-
-# Включаем автозапуск
-echo ""
-echo "Включение автозапуска..."
-systemctl --user enable "$SERVICE_NAME"
-
-if [ $? -eq 0 ]; then
-    echo "✓ Автозапуск включен"
-else
-    echo "✗ Ошибка включения автозапуска"
-    exit 1
-fi
-
-echo ""
+echo
 echo "=========================================="
-echo "Настройка завершена!"
+echo "Установка завершена"
 echo "=========================================="
-echo ""
-echo "Полезные команды:"
-echo "  Запустить сервис:    systemctl --user start $SERVICE_NAME"
-echo "  Остановить сервис:   systemctl --user stop $SERVICE_NAME"
-echo "  Перезапустить:       systemctl --user restart $SERVICE_NAME"
-echo "  Статус:             systemctl --user status $SERVICE_NAME"
-echo "  Логи:               journalctl --user -u $SERVICE_NAME -f"
-echo "  Отключить автозапуск: systemctl --user disable $SERVICE_NAME"
-echo ""
-echo "ВАЖНО: Не забудьте запустить setup_capabilities.sh для установки прав на порт 502!"
-echo "  cd $PROJECT_DIR"
-echo "  bash setup_capabilities.sh"
-echo ""
-
+echo "Статус:       sudo systemctl status $SERVICE_NAME"
+echo "Логи:         sudo journalctl -u $SERVICE_NAME -n 100 -f"
+echo "Перезапуск:   sudo systemctl restart $SERVICE_NAME"
+echo "Остановка:    sudo systemctl stop $SERVICE_NAME"
+echo "Автозапуск:   sudo systemctl enable $SERVICE_NAME"
+echo "Отключение:   sudo systemctl disable --now $SERVICE_NAME"
+echo
+echo "setup_capabilities.sh для этого сервиса запускать не требуется."

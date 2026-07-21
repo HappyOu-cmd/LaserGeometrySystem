@@ -55,3 +55,6 @@ Backup/
 # Empty folders
 LaserGeometrySystem/
 
+# Local secrets
+key.txt
+

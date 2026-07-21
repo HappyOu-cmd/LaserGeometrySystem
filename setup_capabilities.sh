@@ -1,7 +1,8 @@
 #!/bin/bash
 # Скрипт для установки capabilities на Python бинарник для работы с портом 502 (Modbus TCP)
 
-VENV_PYTHON="/home/stend_1/Laser/LaserGeometrySystem/.venv/bin/python3"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PYTHON="$PROJECT_DIR/.venv/bin/python3"
 
 if [ ! -f "$VENV_PYTHON" ]; then
     echo "Ошибка: не найден Python бинарник в виртуальном окружении: $VENV_PYTHON"
@@ -38,6 +39,5 @@ else
     echo "✗ Ошибка установки capability"
     exit 1
 fi
-
 
 
