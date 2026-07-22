@@ -39,6 +39,7 @@ except ImportError:
     from main import HighSpeedRiftekSensor, apply_system_optimizations
 from modbus_slave_server import ModbusSlaveServer
 from modbus_database_integration import ModbusDatabaseIntegration
+from linear_encoder_rtu import EncoderSample, LinearEncoderRtuReader
 
 try:
     from docx import Document
@@ -163,8 +164,8 @@ class SystemState(Enum):
 class LaserGeometrySystem:
     """Основная система лазерной геометрии"""
     
-    def __init__(self, port: str = '/dev/ttyUSB0', baudrate: int = 921600, modbus_port: int = 502, 
-                 test_mode: bool = False):
+    def __init__(self, port: str = '/dev/ttyUSB0', baudrate: int = 921600, modbus_port: int = 502,
+                 test_mode: bool = False, encoder_port: str = '/dev/ttyUSB1'):
         """
         Инициализация системы
         
@@ -173,16 +174,22 @@ class LaserGeometrySystem:
             baudrate: Скорость передачи данных
             modbus_port: Порт Modbus сервера
             test_mode: Режим тестирования без реальных датчиков
+            encoder_port: Отдельный USB-RS485 порт линейного энкодера
         """
         # Настройки датчиков
         self.port = port
         self.baudrate = baudrate
         self.test_mode = test_mode
+        self.encoder_port = encoder_port
         
         # Компоненты системы
         self.sensors = None
+        self.linear_encoder = None
         self.modbus_server = None
         self.db_integration = None
+        self.linear_encoder_last_position = None
+        self.linear_encoder_event_lock = threading.Lock()
+        self.linear_encoder_pending_events = deque(maxlen=20)
         self.data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
         try:
             os.makedirs(self.data_dir, exist_ok=True)
@@ -407,6 +414,16 @@ class LaserGeometrySystem:
         # иначе поток чтения датчиков завершится, не войдя в цикл
         self.is_running = True
 
+        # Линейный энкодер использует отдельный USB-RS485 и собственный поток.
+        self.initialize_linear_encoder_registers()
+        if not self.test_mode:
+            self.linear_encoder = LinearEncoderRtuReader(
+                port=self.encoder_port,
+                on_sample=self.handle_linear_encoder_sample,
+                on_connection_change=self.handle_linear_encoder_connection_change,
+            )
+            self.linear_encoder.start()
+
         # Запуск потока чтения датчиков для доставки данных через очередь
         if self.sensors and not self.test_mode and not self.sensor_reading_active:
             self.sensor_reading_active = True
@@ -455,6 +472,15 @@ class LaserGeometrySystem:
                 print(f" Ошибка отключения датчиков: {e}")
             finally:
                 self.sensors = None
+
+        # Ошибки или зависание энкодера не должны мешать штатной остановке системы.
+        if self.linear_encoder:
+            try:
+                self.linear_encoder.stop(timeout=1.0)
+            except Exception:
+                pass
+            finally:
+                self.linear_encoder = None
             
         if self.db_integration:
             try:
@@ -543,6 +569,57 @@ class LaserGeometrySystem:
             traceback.print_exc()
         finally:
             print(" [SENSOR THREAD] Поток чтения датчиков завершен")
+
+    def initialize_linear_encoder_registers(self):
+        """Инициализирует live-регистры энкодера; они намеренно не сохраняются в БД."""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                self.modbus_server.slave_context.setValues(3, 584, [0, 0])
+                self.modbus_server.slave_context.setValues(3, 586, [0])
+        except Exception:
+            pass
+
+    def handle_linear_encoder_sample(self, sample: EncoderSample):
+        """Записывает последнее положение Float32 в 40584-40585 (high word, low word)."""
+        self.linear_encoder_last_position = sample.position_mm
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                low_word, high_word = self.float_to_doubleword(sample.position_mm)
+                self.modbus_server.slave_context.setValues(
+                    3, 584, [int(high_word), int(low_word)]
+                )
+        except Exception:
+            # Ошибка публикации энкодера не влияет на лазеры и автомат состояний.
+            pass
+
+    def handle_linear_encoder_connection_change(self, online: bool, last_position: Optional[float]):
+        """Немедленно обновляет 40586 и откладывает текст события до состояния IDLE."""
+        try:
+            if self.modbus_server and self.modbus_server.slave_context:
+                self.modbus_server.slave_context.setValues(3, 586, [1 if online else 0])
+        except Exception:
+            pass
+
+        if last_position is None:
+            last_position = self.linear_encoder_last_position
+        with self.linear_encoder_event_lock:
+            self.linear_encoder_pending_events.append((bool(online), last_position))
+
+    def log_linear_encoder_events_in_idle(self):
+        """Выводит накопленные переходы энкодера только из обработчика IDLE."""
+        with self.linear_encoder_event_lock:
+            events = list(self.linear_encoder_pending_events)
+            self.linear_encoder_pending_events.clear()
+
+        for online, last_position in events:
+            value_text = (
+                f"{last_position:.3f} мм" if last_position is not None else "нет корректных измерений"
+            )
+            state_text = "подключен" if online else "отключен"
+            print(
+                f" [IDLE] Линейный энкодер {state_text}; "
+                f"последнее измеренное значение: {value_text}"
+            )
     
     def get_sensor_data(self, timeout=0.001):
         """
@@ -3557,6 +3634,7 @@ class LaserGeometrySystem:
     def handle_idle_state(self):
         """Обработка состояния ожидания"""
         try:
+            self.log_linear_encoder_events_in_idle()
             # Раз в секунду мониторим подключение датчиков и выполняем авто-переподключение
             current_time = time.time()
             if current_time - self.idle_monitor_last_time >= 1.0:
@@ -6576,4 +6654,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
